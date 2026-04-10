@@ -1,0 +1,19 @@
+{
+  "task_type": "小号做动作",
+  "action_key": "2",
+  "interval_min": 8,
+  "interval_max": 20,
+  "duration": 60,
+  "auto_shutdown": false,
+  "window_width": 1280,
+  "window_height": 720,
+  "window_x": 0,
+  "window_y": 0,
+  "force_topmost": false,
+  "random_cruise": false,
+  "cruise_probability": 50,
+  "cruise_hold_min": 0.5,
+  "cruise_hold_max": 1.0,
+  "cruise_space_min": 1,
+  "cruise_space_max": 2
+}

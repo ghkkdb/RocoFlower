@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Nuitka
+*.onefile-build/
+*.build/
+*.dist/
+nuitka_cache/
+nuitka-crash-report.xml
+
+# MinGW工具链
+winlibs_mingw/
+
+# 授权文件
+license.key
+*.key
+
+# 可执行文件
+*.exe
+*.dll
+
+# IDE
+.trae/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 操作系统
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 日志文件
+*.log
