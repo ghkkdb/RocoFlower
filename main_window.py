@@ -68,24 +68,61 @@ class LicenseDialog(QDialog):
     显示机器码并提示用户获取授权。
     """
     
-    def __init__(self, machine_id: str, parent=None):
+    def __init__(self, result: str, parent=None):
         """
         初始化授权对话框。
         Args:
-            machine_id: 机器码
+            result: 授权验证结果，可能包含错误类型前缀
             parent: 父窗口
         """
         super().__init__(parent)
         self.setWindowTitle("授权验证")
-        self.setFixedSize(400, 200)
+        self.setFixedSize(400, 220)
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
         
         layout = QVBoxLayout(self)
         layout.setSpacing(15)
         
-        info_label = QLabel("程序未授权，请将以下机器码发送给开发者获取授权文件：")
+        error_type = None
+        machine_id = result
+        
+        if result.startswith("ERROR:"):
+            error_type = "ERROR"
+            error_msg = result[6:]
+            info_label = QLabel(f"系统环境异常，无法验证授权：\n\n{error_msg}")
+            info_label.setWordWrap(True)
+            info_label.setStyleSheet("color: #D32F2F;")
+            layout.addWidget(info_label)
+            
+            self.machine_id_edit = None
+            btn_layout = QHBoxLayout()
+            btn_layout.addStretch()
+            close_btn = QPushButton("关闭")
+            close_btn.setFixedWidth(80)
+            close_btn.clicked.connect(self.reject)
+            btn_layout.addWidget(close_btn)
+            layout.addLayout(btn_layout)
+            return
+            
+        elif result.startswith("FORMAT:"):
+            error_type = "FORMAT"
+            machine_id = result[7:]
+            info_text = "授权文件格式错误，请重新获取授权文件："
+            
+        elif result.startswith("SIGNATURE:"):
+            error_type = "SIGNATURE"
+            machine_id = result[10:]
+            info_text = "授权文件签名无效（可能被篡改），请重新获取授权文件："
+            
+        else:
+            info_text = "程序未授权，请将以下机器码发送给开发者获取授权文件："
+        
+        info_label = QLabel(info_text)
         info_label.setWordWrap(True)
-        info_label.setStyleSheet("color: #333;")
+        if error_type:
+            info_label.setStyleSheet("color: #D32F2F;")
+        else:
+            info_label.setStyleSheet("color: #333;")
         layout.addWidget(info_label)
         
         self.machine_id_edit = QLineEdit(machine_id)
@@ -93,37 +130,38 @@ class LicenseDialog(QDialog):
         self.machine_id_edit.setReadOnly(True)
         self.machine_id_edit.setStyleSheet("""
             QLineEdit {
+                font-family: 'Consolas', 'Courier New', monospace;
                 font-size: 18px;
                 font-weight: bold;
-                padding: 10px;
-                background-color: #f0f0f0;
-                border: 2px solid #0078d4;
-                border-radius: 5px;
+                padding: 8px;
+                background-color: #f5f5f5;
+                border: 2px solid #ddd;
+                border-radius: 4px;
             }
         """)
         layout.addWidget(self.machine_id_edit)
         
         btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
         
         copy_btn = QPushButton("复制机器码")
-        copy_btn.setFixedWidth(120)
+        copy_btn.setFixedWidth(100)
         copy_btn.clicked.connect(self._copy_machine_id)
         btn_layout.addWidget(copy_btn)
         
-        btn_layout.addStretch()
-        
-        exit_btn = QPushButton("退出程序")
-        exit_btn.setFixedWidth(100)
-        exit_btn.clicked.connect(self.reject)
-        btn_layout.addWidget(exit_btn)
+        close_btn = QPushButton("关闭")
+        close_btn.setFixedWidth(80)
+        close_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(close_btn)
         
         layout.addLayout(btn_layout)
     
     def _copy_machine_id(self):
         """复制机器码到剪贴板。"""
-        clipboard = QApplication.clipboard()
-        clipboard.setText(self.machine_id_edit.text())
-        QMessageBox.information(self, "提示", "机器码已复制到剪贴板")
+        if self.machine_id_edit:
+            clipboard = QApplication.clipboard()
+            clipboard.setText(self.machine_id_edit.text())
+            QMessageBox.information(self, "提示", "机器码已复制到剪贴板")
 
 
 class ShutdownConfirmDialog(QDialog):
@@ -259,7 +297,7 @@ class MainWindow(QMainWindow):
     
     def _init_ui(self):
         """初始化用户界面。"""
-        self.setWindowTitle("RocoFlower V2.4.3")
+        self.setWindowTitle("RocoFlower V2.4.5")
         self.setMinimumSize(700, 600)
         self.resize(800, 700)
         
@@ -336,7 +374,7 @@ class MainWindow(QMainWindow):
         
         layout.addStretch()
         
-        self.help_btn = QPushButton("使用说明")
+        self.help_btn = QPushButton("点击查看使用手册")
         self.help_btn.setMinimumWidth(80)
         layout.addWidget(self.help_btn)
         
@@ -357,7 +395,7 @@ class MainWindow(QMainWindow):
         
         self.task_type_group = QButtonGroup(self)
         
-        self.radio_small_account = QRadioButton("小号做动作")
+        self.radio_small_account = QRadioButton("小号做动作(动作+跳)")
         self.radio_host_action = QRadioButton("房主同乘做动作")
         
         self.task_type_group.addButton(self.radio_small_account, 0)
@@ -430,7 +468,7 @@ class MainWindow(QMainWindow):
         row3_layout.addWidget(QLabel("巡航触发概率:"))
         self.cruise_probability_spin = QSpinBox()
         self.cruise_probability_spin.setRange(1, 100)
-        self.cruise_probability_spin.setValue(50)
+        self.cruise_probability_spin.setValue(22)
         self.cruise_probability_spin.setSuffix("%")
         self.cruise_probability_spin.setMinimumWidth(70)
         row3_layout.addWidget(self.cruise_probability_spin)
@@ -439,8 +477,8 @@ class MainWindow(QMainWindow):
         
         row3_layout.addWidget(QLabel("移动时长:"))
         self.cruise_hold_min_spin = QDoubleSpinBox()
-        self.cruise_hold_min_spin.setRange(0.1, 10.0)
-        self.cruise_hold_min_spin.setValue(0.5)
+        self.cruise_hold_min_spin.setRange(0, 0.5)
+        self.cruise_hold_min_spin.setValue(0.2)
         self.cruise_hold_min_spin.setSingleStep(0.1)
         self.cruise_hold_min_spin.setMinimumWidth(60)
         row3_layout.addWidget(self.cruise_hold_min_spin)
@@ -448,8 +486,8 @@ class MainWindow(QMainWindow):
         row3_layout.addWidget(QLabel("-"))
         
         self.cruise_hold_max_spin = QDoubleSpinBox()
-        self.cruise_hold_max_spin.setRange(0.1, 10.0)
-        self.cruise_hold_max_spin.setValue(1.0)
+        self.cruise_hold_max_spin.setRange(0, 0.5)
+        self.cruise_hold_max_spin.setValue(0.4)
         self.cruise_hold_max_spin.setSingleStep(0.1)
         self.cruise_hold_max_spin.setMinimumWidth(60)
         row3_layout.addWidget(self.cruise_hold_max_spin)
@@ -460,16 +498,16 @@ class MainWindow(QMainWindow):
         
         row3_layout.addWidget(QLabel("空格次数:"))
         self.cruise_space_min_spin = QSpinBox()
-        self.cruise_space_min_spin.setRange(1, 10)
-        self.cruise_space_min_spin.setValue(1)
+        self.cruise_space_min_spin.setRange(0,2)
+        self.cruise_space_min_spin.setValue(0)
         self.cruise_space_min_spin.setMinimumWidth(50)
         row3_layout.addWidget(self.cruise_space_min_spin)
         
         row3_layout.addWidget(QLabel("-"))
         
         self.cruise_space_max_spin = QSpinBox()
-        self.cruise_space_max_spin.setRange(1, 10)
-        self.cruise_space_max_spin.setValue(2)
+        self.cruise_space_max_spin.setRange(0,2)
+        self.cruise_space_max_spin.setValue(1)
         self.cruise_space_max_spin.setMinimumWidth(50)
         row3_layout.addWidget(self.cruise_space_max_spin)
         
@@ -669,41 +707,12 @@ class MainWindow(QMainWindow):
     
     def _on_help_clicked(self):
         """使用说明按钮点击处理。"""
-        help_text = """<h3>使用说明</h3>
-<p><b>【窗口绑定】</b><br>
-1. 点击瞄准镜按钮并拖拽到目标游戏窗口<br>
-2. 释放鼠标完成窗口绑定<br>
-3. 绑定成功后会显示窗口信息</p>
-
-<p><b>【任务配置】</b><br>
-- 任务类型：选择"小号做动作"或"房主同乘做动作"<br>
-- 动作按键：选择要执行的按键（1-5）<br>
-- 动作间隔：设置每次动作的时间间隔（5-60秒）<br>
-- 运行时长：设置任务运行的总时长（1-300分钟）</p>
-
-<p><b>【窗口控制】</b><br>
-- 可调整目标窗口的宽度、高度和位置<br>
-- 设置完成后点击"应用"按钮生效<br>
-- 绑定窗口默认取消置顶，可选是否强制顶置
-</p>
-
-<p><b>【控制按钮】</b><br>
-- 开始：启动任务执行<br>
-- 停止：停止当前任务<br>
-- 解绑：解除窗口绑定，停止任务</p>
-
-<p><span style="color: red;"><b>【注意事项】</b><br>
-- 绑定之前确保目标窗口已打开并处于可见状态<br>
-- 将游戏窗口修改为窗口模式<br>
-- 任务运行过程中请勿最小化目标窗口</span></p>
-
-<p><i>（更多内容待补充...）</i></p>"""
-        
-        msg_box = QMessageBox(self)
-        msg_box.setWindowTitle("使用说明")
-        msg_box.setText(help_text)
-        msg_box.setTextFormat(Qt.RichText)
-        msg_box.exec_()
+        import webbrowser
+        url = "https://wcn33wxdu7tm.feishu.cn/wiki/YGWiwIhsyio98NkiV95cpIcsnAc"
+        try:
+            webbrowser.open(url)
+        except Exception as e:
+            self.append_log(f"打开链接失败: {str(e)}")
     
     def _on_start_clicked(self):
         """开始按钮点击处理。"""

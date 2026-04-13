@@ -171,17 +171,20 @@ def task_1(
                 # log("  按键 [Tab]")
 
                 humanized_key_press(hwnd, 'Tab')
-                humanized_sleep(1, variation=0.15)
+                humanized_sleep(0.5, variation=0.15)
 
                 # log(f"  按键 [{动作}]")
                 humanized_key_press(hwnd, 动作)
-                humanized_sleep(2, variation=0.15)
+                humanized_sleep(0.5, variation=0.15)
                
                 if stop_event.is_set():
                     break
                 # log("  按键 [Escape]")
                 humanized_key_press(hwnd, 'Escape')
-                humanized_sleep(1, variation=0.15)
+                humanized_sleep(0.5, variation=0.15)
+
+                humanized_key_press(hwnd, 'space')
+                humanized_sleep(0.5, variation=0.15)
                 last_time = time.time()
                 current_interval = get_random_interval()
                 
@@ -207,32 +210,34 @@ def task_1(
                 humanized_key_press(hwnd, 'X')
                 if stop_event.is_set():
                     break
-                humanized_sleep(1, variation=0.15)
+                humanized_sleep(0.5, variation=0.15)
                 
                 log("  按键 [Tab]")
                 humanized_key_press(hwnd, 'Tab')
                 if stop_event.is_set():
                     break
-                humanized_sleep(1, variation=0.15)
+                humanized_sleep(0.5, variation=0.15)
                 
                 log(f"  按键 [{动作}]")
                 humanized_key_press(hwnd, 动作)
                 if stop_event.is_set():
                     break
-                humanized_sleep(2, variation=0.15)
+                humanized_sleep(0.5, variation=0.15)
                 
                 log("  按键 [Escape]")
                 humanized_key_press(hwnd, 'Escape')
                 if stop_event.is_set():
                     break
+                humanized_sleep(0.5, variation=0.15)
 
-                humanized_sleep(1, variation=0.15)
+                humanized_key_press(hwnd, 'space')
+                humanized_sleep(0.5, variation=0.15)
                 if 随机巡航:
                     if random.choice(['direction', 'space']) == 'direction':
                         _execute_direction_cruise()
                     else:
                         _execute_space_cruise()
-                
+
                 log("  按键 [R]")
                 humanized_key_press(hwnd, 'R')
                 if stop_event.is_set():
