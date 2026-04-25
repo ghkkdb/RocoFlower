@@ -6,10 +6,84 @@
 import win32gui
 import win32con
 import win32api
+import win32process
+import win32ui
 import ctypes
+import cv2
+import numpy as np
 import random
+import sys
 import time
-from typing import Optional, Tuple
+from pathlib import Path
+import threading
+from typing import Dict, Optional, Tuple, Union
+
+
+def get_app_dir() -> Path:
+    try:
+        buf = ctypes.create_unicode_buffer(260)
+        ctypes.windll.kernel32.GetModuleFileNameW(None, buf, 260)
+        exe_path = Path(buf.value)
+        if exe_path.exists():
+            return exe_path.parent
+    except Exception:
+        pass
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def _iter_resource_base_dirs() -> list[Path]:
+    seen = set()
+    base_dirs: list[Path] = []
+
+    def add_dir(path_like) -> None:
+        if not path_like:
+            return
+        try:
+            path = Path(path_like).expanduser().resolve()
+        except Exception:
+            return
+        key = str(path).lower()
+        if key in seen:
+            return
+        seen.add(key)
+        base_dirs.append(path)
+
+    # Onefile resources live next to module __file__ after extraction.
+    add_dir(Path(__file__).resolve().parent)
+
+    main_module = sys.modules.get("__main__")
+    if getattr(main_module, "__file__", None):
+        add_dir(Path(main_module.__file__).resolve().parent)
+
+    add_dir(Path.cwd())
+    if sys.argv:
+        add_dir(Path(sys.argv[0]).resolve().parent)
+    if getattr(sys, "executable", None):
+        add_dir(Path(sys.executable).resolve().parent)
+    add_dir(get_app_dir())
+
+    return base_dirs
+
+
+def get_resource_search_paths(path_like: Union[str, Path]) -> list[Path]:
+    path = Path(path_like).expanduser()
+    if path.is_absolute():
+        return [path]
+    return [base_dir / path for base_dir in _iter_resource_base_dirs()]
+
+
+def resolve_resource_path(path_like: Union[str, Path]) -> Path:
+    path = Path(path_like).expanduser()
+    if path.is_absolute():
+        return path
+
+    candidates = get_resource_search_paths(path)
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    return candidates[0].resolve()
 
 
 def get_window_rect(hwnd: int) -> Optional[Tuple[int, int, int, int]]:
@@ -811,7 +885,7 @@ class HumanizedInput:
         )
     
     @staticmethod
-    def _maybe_add_hesitation():
+    def _maybe_add_hesitation(stop_event: Optional[threading.Event] = None) -> bool:
         """
         可能添加犹豫停顿。
         """
@@ -822,15 +896,35 @@ class HumanizedInput:
                 min_val=0.3,
                 max_val=1.5
             )
-            time.sleep(hesitation_time)
+            return not _interruptible_wait(hesitation_time, stop_event)
+        return True
     
     @staticmethod
-    def _simulate_micro_movement():
+    def _simulate_micro_movement(stop_event: Optional[threading.Event] = None) -> bool:
         """
         模拟微小的手部抖动/移动延迟。
         """
         micro_delay = random.uniform(0.01, 0.05)
-        time.sleep(micro_delay)
+        return not _interruptible_wait(micro_delay, stop_event)
+
+
+def _interruptible_wait(
+    duration: float,
+    stop_event: Optional[threading.Event] = None
+) -> bool:
+    """
+    可被停止事件打断的等待。
+
+    Returns:
+        bool: True 表示等待期间被停止；False 表示正常等待完成
+    """
+    duration = max(0.0, float(duration))
+    if duration <= 0:
+        return bool(stop_event and stop_event.is_set())
+    if stop_event is None:
+        time.sleep(duration)
+        return False
+    return stop_event.wait(duration)
 
 
 def humanized_key_press(
@@ -838,7 +932,8 @@ def humanized_key_press(
     key: str,
     base_delay: float = 0.05,
     enable_hesitation: bool = True,
-    enable_rhythm: bool = True
+    enable_rhythm: bool = True,
+    stop_event: Optional[threading.Event] = None
 ) -> bool:
     """
     拟人化后台按键（按下并释放）。
@@ -865,25 +960,32 @@ def humanized_key_press(
             print(f"未知的按键: {key}")
             return False
         
-        if enable_hesitation:
-            HumanizedInput._maybe_add_hesitation()
+        if stop_event and stop_event.is_set():
+            return False
+
+        if enable_hesitation and not HumanizedInput._maybe_add_hesitation(stop_event):
+            return False
         
         scan_code = win32api.MapVirtualKey(vk_code, 0)
         lParam_down = (scan_code << 16) | 1
         lParam_up = (scan_code << 16) | 0xC0000001
         
-        HumanizedInput._simulate_micro_movement()
+        if not HumanizedInput._simulate_micro_movement(stop_event):
+            return False
         
         win32gui.PostMessage(hwnd, win32con.WM_KEYDOWN, vk_code, lParam_down)
         
         key_duration = HumanizedInput._get_key_duration()
-        time.sleep(key_duration)
+        interrupted = _interruptible_wait(key_duration, stop_event)
         
         win32gui.PostMessage(hwnd, win32con.WM_KEYUP, vk_code, lParam_up)
+        if interrupted:
+            return False
         
         if enable_rhythm:
             inter_delay = HumanizedInput._get_inter_key_delay()
-            time.sleep(inter_delay)
+            if _interruptible_wait(inter_delay, stop_event):
+                return False
         
         return True
     except Exception as e:
@@ -895,7 +997,8 @@ def long_press_key(
     hwnd: int,
     key: str,
     duration: float,
-    enable_hesitation: bool = True
+    enable_hesitation: bool = True,
+    stop_event: Optional[threading.Event] = None
 ) -> bool:
     """
     拟人化长按按键（按下并保持一段时间后释放）。
@@ -920,21 +1023,27 @@ def long_press_key(
             print(f"未知的按键: {key}")
             return False
         
-        if enable_hesitation:
-            HumanizedInput._maybe_add_hesitation()
+        if stop_event and stop_event.is_set():
+            return False
+
+        if enable_hesitation and not HumanizedInput._maybe_add_hesitation(stop_event):
+            return False
         
         scan_code = win32api.MapVirtualKey(vk_code, 0)
         lParam_down = (scan_code << 16) | 1
         lParam_up = (scan_code << 16) | 0xC0000001
         
-        HumanizedInput._simulate_micro_movement()
+        if not HumanizedInput._simulate_micro_movement(stop_event):
+            return False
         
         win32gui.PostMessage(hwnd, win32con.WM_KEYDOWN, vk_code, lParam_down)
         
         actual_duration = duration * random.uniform(0.95, 1.05)
-        time.sleep(actual_duration)
+        interrupted = _interruptible_wait(actual_duration, stop_event)
         
         win32gui.PostMessage(hwnd, win32con.WM_KEYUP, vk_code, lParam_up)
+        if interrupted:
+            return False
         
         return True
     except Exception as e:
@@ -946,7 +1055,8 @@ def humanized_key_sequence(
     hwnd: int,
     keys: list,
     inter_key_delay: float = 0.1,
-    enable_hesitation: bool = True
+    enable_hesitation: bool = True,
+    stop_event: Optional[threading.Event] = None
 ) -> bool:
     """
     拟人化按键序列（连续发送多个按键）。
@@ -962,28 +1072,42 @@ def humanized_key_sequence(
     """
     try:
         for key in keys:
-            if not humanized_key_press(hwnd, key, enable_hesitation=enable_hesitation):
+            if stop_event and stop_event.is_set():
+                return False
+            if not humanized_key_press(
+                hwnd,
+                key,
+                enable_hesitation=enable_hesitation,
+                stop_event=stop_event
+            ):
                 return False
             delay = HumanizedInput._get_inter_key_delay()
-            time.sleep(delay)
+            if _interruptible_wait(delay, stop_event):
+                return False
         return True
     except Exception as e:
         print(f"拟人化按键序列失败: {e}")
         return False
 
 
-def humanized_sleep(base_time: float, variation: float = 0.2) -> None:
+def humanized_sleep(
+    base_time: float,
+    variation: float = 0.2,
+    stop_event: Optional[threading.Event] = None
+) -> bool:
     """
     拟人化睡眠（添加随机变化）。
     
     Args:
         base_time (float): 基础时间（秒）
         variation (float): 变化范围比例（0-1）
+
+    Returns:
+        bool: True 表示被停止事件打断；False 表示正常等待完成
     """
     actual_time = base_time * (1 + random.uniform(-variation, variation))
     actual_time = max(0.01, actual_time)
-    # print(f"拟人化睡眠时间: {actual_time:.1f}秒")
-    time.sleep(actual_time)
+    return _interruptible_wait(actual_time, stop_event)
 
 
 def get_humanized_delay(
@@ -1004,3 +1128,474 @@ def get_humanized_delay(
     """
     multiplier = random.uniform(min_multiplier, max_multiplier)
     return base_delay * multiplier
+
+
+def click_mouse(
+    hwnd: int,
+    x: int,
+    y: int,
+    button: str = 'left',
+    hold_time: float = 0.05,
+    stop_event: Optional[threading.Event] = None
+) -> bool:
+    """
+    前台发送鼠标点击到窗口。
+
+    Args:
+        hwnd (int): 窗口句柄
+        x (int): 窗口内 X 坐标
+        y (int): 窗口内 Y 坐标
+        button (str): 鼠标按钮 ('left', 'right', 'middle')
+        hold_time (float): 按键按住到松开的时间（秒），默认0.05秒
+
+    Returns:
+        bool: 操作是否成功
+
+    Raises:
+        ValueError: 当句柄无效时抛出
+    """
+    if not win32gui.IsWindow(hwnd):
+        raise ValueError(f"无效的窗口句柄：{hwnd}")
+    if stop_event and stop_event.is_set():
+        return False
+
+    left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+    
+    screen_x = left + x
+    screen_y = top + y
+
+    if button == 'left':
+        down_event = win32con.MOUSEEVENTF_LEFTDOWN
+        up_event = win32con.MOUSEEVENTF_LEFTUP
+    elif button == 'right':
+        down_event = win32con.MOUSEEVENTF_RIGHTDOWN
+        up_event = win32con.MOUSEEVENTF_RIGHTUP
+    elif button == 'middle':
+        down_event = win32con.MOUSEEVENTF_MIDDLEDOWN
+        up_event = win32con.MOUSEEVENTF_MIDDLEUP
+    else:
+        raise ValueError(f"不支持的鼠标按钮：{button}")
+
+    win32api.SetCursorPos((screen_x, screen_y))
+    if _interruptible_wait(0.02, stop_event):
+        return False
+    win32api.mouse_event(down_event, 0, 0, 0, 0)
+    interrupted = _interruptible_wait(hold_time, stop_event)
+    win32api.mouse_event(up_event, 0, 0, 0, 0)
+    return not interrupted
+
+
+def activate_window(hwnd: int, force: bool = True) -> bool:
+    """
+    激活窗口并将其带到前台。
+
+    Args:
+        hwnd (int): 窗口句柄
+        force (bool): 是否强制激活（使用 AttachThreadInput 技术），默认 True
+
+    Returns:
+        bool: 操作是否成功
+    """
+    if not win32gui.IsWindow(hwnd):
+        print(f"无效的窗口句柄：{hwnd}")
+        return False
+
+    try:
+        if win32gui.IsIconic(hwnd):
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+
+        if force:
+            foreground_hwnd = win32gui.GetForegroundWindow()
+            if foreground_hwnd != hwnd:
+                foreground_thread = win32process.GetWindowThreadProcessId(foreground_hwnd)[0]
+                current_thread = win32api.GetCurrentThreadId()
+                target_thread = win32process.GetWindowThreadProcessId(hwnd)[0]
+
+                if current_thread != target_thread:
+                    ctypes.windll.user32.AttachThreadInput(current_thread, target_thread, True)
+                    if foreground_thread != current_thread:
+                        ctypes.windll.user32.AttachThreadInput(current_thread, foreground_thread, True)
+
+                win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+                win32gui.SetForegroundWindow(hwnd)
+                win32gui.SetFocus(hwnd)
+
+                if current_thread != target_thread:
+                    ctypes.windll.user32.AttachThreadInput(current_thread, target_thread, False)
+                    if foreground_thread != current_thread:
+                        ctypes.windll.user32.AttachThreadInput(current_thread, foreground_thread, False)
+        else:
+            win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+            win32gui.SetForegroundWindow(hwnd)
+
+        return True
+    except Exception as e:
+        print(f"激活窗口失败: {e}")
+        return False
+
+def deactivate_window(hwnd: int, force: bool = True, minimize_if_failed: bool = False) -> bool:
+    """
+    取消激活窗口，使其失去前台焦点。
+
+    注意：
+        Windows 没有直接“取消激活某窗口”的标准 API，
+        本函数通过将焦点切换到桌面来实现“取消激活”的效果。
+        如果失败，可选择最小化目标窗口。
+
+    Args:
+        hwnd (int): 目标窗口句柄
+        force (bool): 是否强制切换焦点（使用 AttachThreadInput 技术），默认 True
+        minimize_if_failed (bool): 若切换到桌面失败，是否最小化目标窗口，默认 False
+
+    Returns:
+        bool: 操作是否成功
+    """
+    if not win32gui.IsWindow(hwnd):
+        print(f"无效的窗口句柄：{hwnd}")
+        return False
+
+    try:
+        foreground_hwnd = win32gui.GetForegroundWindow()
+
+        # 如果目标窗口本来就不是前台窗口，视为已取消激活
+        if foreground_hwnd != hwnd:
+            return True
+
+        # 获取桌面/外壳窗口句柄
+        desktop_hwnd = win32gui.GetDesktopWindow()
+        shell_hwnd = ctypes.windll.user32.GetShellWindow()
+
+        target_switch_hwnd = shell_hwnd if shell_hwnd else desktop_hwnd
+        if not target_switch_hwnd or not win32gui.IsWindow(target_switch_hwnd):
+            print("无法获取可切换的桌面窗口句柄")
+            if minimize_if_failed:
+                win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
+                return True
+            return False
+
+        if force:
+            current_thread = win32api.GetCurrentThreadId()
+            foreground_thread = win32process.GetWindowThreadProcessId(foreground_hwnd)[0]
+            switch_thread = win32process.GetWindowThreadProcessId(target_switch_hwnd)[0]
+
+            attached_foreground = False
+            attached_switch = False
+
+            try:
+                if current_thread != foreground_thread:
+                    ctypes.windll.user32.AttachThreadInput(current_thread, foreground_thread, True)
+                    attached_foreground = True
+
+                if current_thread != switch_thread:
+                    ctypes.windll.user32.AttachThreadInput(current_thread, switch_thread, True)
+                    attached_switch = True
+
+                win32gui.ShowWindow(target_switch_hwnd, win32con.SW_SHOW)
+                win32gui.SetForegroundWindow(target_switch_hwnd)
+                win32gui.SetFocus(target_switch_hwnd)
+
+            finally:
+                if attached_switch:
+                    ctypes.windll.user32.AttachThreadInput(current_thread, switch_thread, False)
+                if attached_foreground:
+                    ctypes.windll.user32.AttachThreadInput(current_thread, foreground_thread, False)
+        else:
+            win32gui.ShowWindow(target_switch_hwnd, win32con.SW_SHOW)
+            win32gui.SetForegroundWindow(target_switch_hwnd)
+
+        # 检查目标窗口是否已失去前台
+        new_foreground_hwnd = win32gui.GetForegroundWindow()
+        if new_foreground_hwnd != hwnd:
+            return True
+
+        # 可选兜底：最小化目标窗口
+        if minimize_if_failed:
+            win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
+            return True
+
+        return False
+
+    except Exception as e:
+        print(f"取消激活窗口失败: {e}")
+        return False
+
+
+ImageSource = Union[str, Path, np.ndarray]
+Region = Tuple[int, int, int, int]
+
+
+def _get_capture_base_rect(hwnd: int, client_area: bool = False) -> Region:
+    """
+    获取截图基准区域。
+
+    Args:
+        hwnd (int): 窗口句柄
+        client_area (bool): True 时返回客户区在屏幕中的矩形，False 时返回整个窗口矩形
+
+    Returns:
+        Region: (left, top, width, height)
+    """
+    if client_area:
+        left_top = win32gui.ClientToScreen(hwnd, (0, 0))
+        client_rect = win32gui.GetClientRect(hwnd)
+        width = client_rect[2] - client_rect[0]
+        height = client_rect[3] - client_rect[1]
+        return left_top[0], left_top[1], width, height
+
+    rect = win32gui.GetWindowRect(hwnd)
+    return rect[0], rect[1], rect[2] - rect[0], rect[3] - rect[1]
+
+
+def _normalize_capture_region(
+    area_width: int,
+    area_height: int,
+    region: Optional[Region] = None
+) -> Region:
+    """
+    规范化并校验相对截图区域。
+
+    Args:
+        area_width (int): 基准区域宽度
+        area_height (int): 基准区域高度
+        region (Optional[Region]): 相对区域 (x, y, width, height)
+
+    Returns:
+        Region: 规范化后的相对区域 (x, y, width, height)
+    """
+    if area_width <= 0 or area_height <= 0:
+        raise ValueError("窗口截图区域宽高必须大于 0")
+
+    if region is None:
+        return 0, 0, area_width, area_height
+
+    x, y, width, height = map(int, region)
+    if width <= 0 or height <= 0:
+        raise ValueError("截图区域的宽高必须大于 0")
+    if x < 0 or y < 0:
+        raise ValueError("截图区域的 x 和 y 不能小于 0")
+    if x + width > area_width or y + height > area_height:
+        raise ValueError(
+            f"截图区域超出窗口范围: region={region}, window_size=({area_width}, {area_height})"
+        )
+    return x, y, width, height
+
+
+def _capture_screen_region(left: int, top: int, width: int, height: int) -> np.ndarray:
+    """
+    从屏幕拷贝指定区域。
+
+    Returns:
+        np.ndarray: BGR 图像
+    """
+    hwnd_desktop = win32gui.GetDesktopWindow()
+    desktop_dc = win32gui.GetWindowDC(hwnd_desktop)
+    src_dc = win32ui.CreateDCFromHandle(desktop_dc)
+    mem_dc = src_dc.CreateCompatibleDC()
+    bitmap = win32ui.CreateBitmap()
+
+    try:
+        bitmap.CreateCompatibleBitmap(src_dc, width, height)
+        mem_dc.SelectObject(bitmap)
+        mem_dc.BitBlt((0, 0), (width, height), src_dc, (left, top), win32con.SRCCOPY)
+
+        bitmap_bits = bitmap.GetBitmapBits(True)
+        image = np.frombuffer(bitmap_bits, dtype=np.uint8)
+        image.shape = (height, width, 4)
+        return cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+    finally:
+        win32gui.DeleteObject(bitmap.GetHandle())
+        mem_dc.DeleteDC()
+        src_dc.DeleteDC()
+        win32gui.ReleaseDC(hwnd_desktop, desktop_dc)
+
+
+def capture_window_foreground(
+    hwnd: int,
+    region: Optional[Region] = None,
+    client_area: bool = False,
+    ensure_foreground: bool = True,
+    set_topmost: bool = False
+) -> np.ndarray:
+    """
+    通过窗口句柄进行前台截图，可选择窗口内指定位置。
+
+    Args:
+        hwnd (int): 窗口句柄
+        region (Optional[Region]): 相对窗口区域 (x, y, width, height)，不传则截取整个区域
+        client_area (bool): True 时以客户区为基准；False 时以整个窗口为基准
+        ensure_foreground (bool): 是否先确保窗口在前台
+        set_topmost (bool): 激活时是否顺便置顶
+
+    Returns:
+        np.ndarray: BGR 图像
+    """
+    if not win32gui.IsWindow(hwnd):
+        raise ValueError(f"无效的窗口句柄：{hwnd}")
+
+    if ensure_foreground and not ensure_window_foreground(hwnd, set_topmost=set_topmost):
+        raise RuntimeError(f"无法将窗口置于前台：{hwnd}")
+
+    base_left, base_top, area_width, area_height = _get_capture_base_rect(hwnd, client_area)
+    offset_x, offset_y, capture_width, capture_height = _normalize_capture_region(
+        area_width,
+        area_height,
+        region
+    )
+
+    return _capture_screen_region(
+        base_left + offset_x,
+        base_top + offset_y,
+        capture_width,
+        capture_height
+    )
+
+
+def save_window_foreground_screenshot(
+    hwnd: int,
+    save_path: Union[str, Path],
+    region: Optional[Region] = None,
+    client_area: bool = False,
+    ensure_foreground: bool = True,
+    set_topmost: bool = False
+) -> str:
+    """
+    保存窗口前台截图到文件。
+
+    Returns:
+        str: 保存后的绝对路径
+    """
+    image = capture_window_foreground(
+        hwnd=hwnd,
+        region=region,
+        client_area=client_area,
+        ensure_foreground=ensure_foreground,
+        set_topmost=set_topmost
+    )
+
+    save_path = Path(save_path).expanduser().resolve()
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(save_path), image):
+        raise RuntimeError(f"截图保存失败：{save_path}")
+    return str(save_path)
+
+
+def _load_template_image(template: ImageSource) -> np.ndarray:
+    """
+    ??????
+    """
+    if isinstance(template, np.ndarray):
+        template_image = template.copy()
+    else:
+        resource_candidates = get_resource_search_paths(template)
+        template_path = resolve_resource_path(template)
+        template_image = cv2.imread(str(template_path), cv2.IMREAD_UNCHANGED)
+        if template_image is None:
+            attempted_paths = " | ".join(str(candidate) for candidate in resource_candidates)
+            raise FileNotFoundError(
+                f"????????: {template_path} | ????: {template} | ????: {attempted_paths}"
+            )
+
+    if template_image.ndim == 2:
+        return template_image
+    if template_image.ndim == 3 and template_image.shape[2] == 4:
+        return cv2.cvtColor(template_image, cv2.COLOR_BGRA2BGR)
+    return template_image
+
+
+def _prepare_match_image(image: np.ndarray, grayscale: bool) -> np.ndarray:
+    """
+    按匹配模式预处理图像。
+    """
+    if grayscale and image.ndim == 3:
+        return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    return image
+
+
+def match_template_in_window_foreground(
+    hwnd: int,
+    template: ImageSource,
+    region: Optional[Region] = None,
+    client_area: bool = False,
+    threshold: float = 0.8,
+    ensure_foreground: bool = True,
+    set_topmost: bool = False,
+    grayscale: bool = False,
+    method: int = cv2.TM_CCOEFF_NORMED
+) -> Dict[str, Union[bool, float, Tuple[int, int], Region]]:
+    """
+    在窗口前台截图中进行模板匹配，可限制到窗口内指定位置。
+
+    Args:
+        hwnd (int): 窗口句柄
+        template (ImageSource): 模板图片路径或 numpy 图像
+        region (Optional[Region]): 只在该相对区域内匹配 (x, y, width, height)
+        client_area (bool): True 时以客户区为基准；False 时以整个窗口为基准
+        threshold (float): 匹配阈值。对 SQDIFF 系列方法表示最大允许误差，其他方法表示最小置信度
+        ensure_foreground (bool): 是否先确保窗口在前台
+        set_topmost (bool): 激活时是否顺便置顶
+        grayscale (bool): 是否转为灰度图后匹配
+        method (int): cv2.matchTemplate 的匹配方法
+
+    Returns:
+        Dict[str, Union[bool, float, Tuple[int, int], Region]]:
+            matched: 是否匹配成功
+            confidence: 匹配值
+            top_left: 命中左上角，相对当前基准区域
+            center: 命中中心点，相对当前基准区域
+            screen_top_left: 命中左上角的屏幕坐标
+            screen_center: 命中中心点的屏幕坐标
+            search_region: 实际搜索区域，相对当前基准区域
+    """
+    screenshot = capture_window_foreground(
+        hwnd=hwnd,
+        region=region,
+        client_area=client_area,
+        ensure_foreground=ensure_foreground,
+        set_topmost=set_topmost
+    )
+    template_image = _load_template_image(template)
+
+    search_image = _prepare_match_image(screenshot, grayscale)
+    template_image = _prepare_match_image(template_image, grayscale)
+
+    search_height, search_width = search_image.shape[:2]
+    template_height, template_width = template_image.shape[:2]
+    if template_width > search_width or template_height > search_height:
+        raise ValueError(
+            "模板尺寸不能大于搜索区域尺寸: "
+            f"template=({template_width}, {template_height}), "
+            f"search=({search_width}, {search_height})"
+        )
+
+    result = cv2.matchTemplate(search_image, template_image, method)
+    min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+
+    sqdiff_methods = {cv2.TM_SQDIFF, cv2.TM_SQDIFF_NORMED}
+    if method in sqdiff_methods:
+        confidence = float(min_val)
+        matched = confidence <= threshold
+        match_left, match_top = min_loc
+    else:
+        confidence = float(max_val)
+        matched = confidence >= threshold
+        match_left, match_top = max_loc
+
+    base_left, base_top, area_width, area_height = _get_capture_base_rect(hwnd, client_area)
+    search_region = _normalize_capture_region(area_width, area_height, region)
+    region_x, region_y, _, _ = search_region
+
+    top_left = (region_x + match_left, region_y + match_top)
+    center = (
+        top_left[0] + template_width // 2,
+        top_left[1] + template_height // 2
+    )
+
+    return {
+        "matched": matched,
+        "confidence": confidence,
+        "top_left": top_left,
+        "center": center,
+        "screen_top_left": (base_left + top_left[0], base_top + top_left[1]),
+        "screen_center": (base_left + center[0], base_top + center[1]),
+        "search_region": search_region,
+    }

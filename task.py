@@ -1,249 +1,552 @@
-import time
-import threading
 import random
-from tools import background_key_press, humanized_key_press, humanized_sleep
+import threading
+from datetime import datetime, timedelta
+from typing import Callable, Optional
+
+import win32con
+import win32gui
+
+from tools import (
+    activate_window,
+    click_mouse,
+    deactivate_window,
+    humanized_key_press,
+    humanized_sleep,
+    match_template_in_window_foreground,
+)
+
+
+Logger = Optional[Callable[[str, Optional[str]], None]]
+_time_adjust_keep_open_hwnds: set[int] = set()
+
+
+def _emit_log(log_callback: Logger, message: str, color: Optional[str] = None) -> None:
+    if log_callback:
+        log_callback(message, color)
+    else:
+        print(message)
+
+
+def _wait_or_stop(stop_event: threading.Event, seconds: float) -> bool:
+    return stop_event.wait(max(0.0, float(seconds)))
+
+
+def _ensure_window_topmost(hwnd: int, log: Logger = None) -> bool:
+    try:
+        ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+        if ex_style & win32con.WS_EX_TOPMOST:
+            return True
+        win32gui.SetWindowPos(
+            hwnd,
+            win32con.HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_SHOWWINDOW,
+        )
+        _emit_log(log, "检测到窗口未置顶，已强制置顶")
+        return True
+    except Exception as exc:
+        _emit_log(log, f"窗口置顶检测失败: {exc}", "red")
+        return False
+
+
+def _match_template_with_topmost(hwnd: int, template_path: str, log: Logger = None, **kwargs):
+    _ensure_window_topmost(hwnd, log=log)
+    return match_template_in_window_foreground(hwnd, template_path, **kwargs)
+
+
+def _match_template_direct(hwnd: int, template_path: str, **kwargs):
+    return match_template_in_window_foreground(hwnd, template_path, ensure_foreground=False, **kwargs)
+
+
+def _long_press_key(hwnd: int, key: str, duration: float, stop_event: threading.Event) -> bool:
+    import win32api
+    import win32con
+
+    key_map = {
+        "W": 0x57,
+        "S": 0x53,
+        "A": 0x41,
+        "D": 0x44,
+        "SPACE": 0x20,
+    }
+
+    vk_code = key_map.get(key.upper())
+    if vk_code is None:
+        return False
+
+    win32api.PostMessage(hwnd, win32con.WM_KEYDOWN, vk_code, 0)
+    interrupted = _wait_or_stop(stop_event, duration)
+    win32api.PostMessage(hwnd, win32con.WM_KEYUP, vk_code, 0)
+    return not interrupted
 
 
 def task_1(
-    hwnd: int, 
-    动作, 
-    间隔_min: int, 
-    间隔_max: int, 
-    任务类型, 
-    随机巡航: bool = False, 
-    巡航概率: int = 50,
+    hwnd: int,
+    动作,
+    间隔_min: int,
+    间隔_max: int,
+    任务类型,
+    同乘精灵: int = 1,
+    防变果冻: bool = True,
+    随机巡航: bool = False,
+    巡航概率: int = 25,
     长按最小: float = 0.0,
     长按最大: float = 1.5,
     空格最小: int = 1,
     空格最大: int = 2,
-    stop_event: threading.Event = None, 
-    log_callback=None
+    动作跳: bool = True,
+    stop_event: threading.Event = None,
+    log_callback: Logger = None,
 ):
     """
-    任务函数。
-    
-    Args:
-        hwnd: 窗口句柄
-        动作: 动作按键
-        间隔_min: 最小动作间隔（秒）
-        间隔_max: 最大动作间隔（秒）
-        任务类型: 任务类型（"小号做动作" 或 "房主同乘做动作"）
-        随机巡航: 是否开启随机巡航功能
-        巡航概率: 随机巡航触发概率（1-100）
-        长按最小: 长按方向键最小时长（秒）
-        长按最大: 长按方向键最大时长（秒）
-        空格最小: 点按空格最小次数
-        空格最大: 点按空格最大次数
-        stop_event: 停止事件，用于安全停止任务
-        log_callback: 日志回调函数，用于输出日志到UI
+    主任务循环。
     """
     if stop_event is None:
         stop_event = threading.Event()
-    
-    def log(message, color=None):
-        if log_callback:
-            log_callback(message, color)
-        else:
-            print(message)
-    
+
+    def log(message: str, color: Optional[str] = None) -> None:
+        _emit_log(log_callback, message, color)
+
+    def press(key: str, enable_hesitation: bool = True, enable_rhythm: bool = True) -> bool:
+        if stop_event.is_set():
+            return False
+        return humanized_key_press(
+            hwnd,
+            key,
+            enable_hesitation=enable_hesitation,
+            enable_rhythm=enable_rhythm,
+            stop_event=stop_event,
+        )
+
+    def sleep_for(seconds: float, variation: float = 0.2) -> bool:
+        return humanized_sleep(seconds, variation=variation, stop_event=stop_event)
+
+    def get_random_interval() -> float:
+        return random.uniform(间隔_min, 间隔_max)
+
     if 间隔_min > 间隔_max:
         log(f"警告: 动作间隔最小值({间隔_min})大于最大值({间隔_max})，已自动交换", color="red")
         间隔_min, 间隔_max = 间隔_max, 间隔_min
-    
+
     if 长按最小 > 长按最大:
         log(f"警告: 长按时长最小值({长按最小})大于最大值({长按最大})，已自动交换", color="red")
         长按最小, 长按最大 = 长按最大, 长按最小
-    
+
     if 空格最小 > 空格最大:
         log(f"警告: 空格次数最小值({空格最小})大于最大值({空格最大})，已自动交换", color="red")
         空格最小, 空格最大 = 空格最大, 空格最小
-    
-    def get_random_interval():
-        """获取随机间隔时间。"""
-        return random.uniform(间隔_min, 间隔_max)
-    
-    def _long_press_key(hwnd: int, key: str, duration: float):
-        """
-        长按按键。
-        
-        Args:
-            hwnd: 窗口句柄
-            key: 按键名称
-            duration: 按键时长（秒）
-        """
-        import win32api
-        import win32con
-        
-        key_map = {
-            'W': 0x57,
-            'S': 0x53,
-            'A': 0x41,
-            'D': 0x44,
-            'Space': 0x20,
-        }
-        
-        vk_code = key_map.get(key.upper())
-        if not vk_code:
-            return
-        
-        win32api.PostMessage(hwnd, win32con.WM_KEYDOWN, vk_code, 0)
-        
-        start_time = time.time()
-        while time.time() - start_time < duration:
-            if stop_event.is_set():
-                win32api.PostMessage(hwnd, win32con.WM_KEYUP, vk_code, 0)
-                return
-            time.sleep(0.01)
-        
-        win32api.PostMessage(hwnd, win32con.WM_KEYUP, vk_code, 0)
-    
-    def _execute_direction_cruise():
-        """
-        执行方向键随机巡航。
-        
-        长按方向键 W/S/A/D（向前走后需反向走回原点）
-        """
-        if random.randint(1, 100) > 巡航概率:
+
+    def _execute_direction_cruise() -> bool:
+        if random.randint(1, 100) > 巡航概率 or stop_event.is_set():
             return False
-        
-        directions = ['W', 'S', 'A', 'D']
-        direction = random.choice(directions)
+
+        direction = random.choice(["W", "S", "A", "D"])
         hold_time = random.uniform(长按最小, 长按最大)
-        
-        log(f"  [随机巡航] 长按方向键 [{direction}] {hold_time:.1f}秒")
-        _long_press_key(hwnd, direction, hold_time)
-        
-        if stop_event.is_set():
-            return True
-        
-        if direction == 'W':
-            reverse_direction = 'S'
-        elif direction == 'S':
-            reverse_direction = 'W'
-        elif direction == 'A':
-            reverse_direction = 'D'
-        else:
-            reverse_direction = 'A'
-        
+        reverse_direction = {"W": "S", "S": "W", "A": "D", "D": "A"}[direction]
+
+        log(f"  [随机巡航] 长按方向键 [{direction}] {hold_time:.2f}秒")
+        if not _long_press_key(hwnd, direction, hold_time, stop_event):
+            return False
+
+        if sleep_for(0.2, variation=0.2):
+            return False
+
         log(f"  [随机巡航] 长按方向键 [{direction}] 完成，反向走回...")
-        humanized_sleep(0.2, variation=0.2)
-        
-        if stop_event.is_set():
-            return True
-        
-        _long_press_key(hwnd, reverse_direction, hold_time)
-        
-        if stop_event.is_set():
-            return True
-        
+        if not _long_press_key(hwnd, reverse_direction, hold_time, stop_event):
+            return False
+
         log(f"  [随机巡航] 长按方向键 [{reverse_direction}] 完成")
         return True
-    
-    def _execute_space_cruise():
-        """
-        执行空格随机巡航。
-        
-        点按空格键
-        """
-        if random.randint(1, 100) > 巡航概率:
+
+    def _execute_space_cruise() -> bool:
+        if random.randint(1, 100) > 巡航概率 or stop_event.is_set():
             return False
-        
+
         tap_count = random.randint(空格最小, 空格最大)
         log(f"  [随机巡航] 点按空格键 {tap_count}次")
-        
+
         for _ in range(tap_count):
-            if stop_event.is_set():
-                return True
-            humanized_key_press(hwnd, 'Space')
-            humanized_sleep(1, variation=0.3)
-        
+            if not press("Space"):
+                return False
+            if sleep_for(1, variation=0.3):
+                return False
         return True
-    
-    if 任务类型 == "小号做动作":
-        last_time = time.time()
+
+    def _maybe_execute_cruise() -> None:
+        if not 随机巡航 or stop_event.is_set():
+            return
+        if sleep_for(0.2, variation=0.3):
+            return
+        if random.choice(["direction", "space"]) == "direction":
+            _execute_direction_cruise()
+        else:
+            _execute_space_cruise()
+
+    def _run_small_account_once(iteration: int, interval: float) -> bool:
+        log(f"执行动作: 第{iteration}次按执行动作 [{动作}]，下次间隔: {interval:.1f}秒")
+
+        if 防变果冻:
+            # log("防变果冻")
+            if not press("X"):
+                return False
+            if sleep_for(1, variation=0.15):
+                return False
+
+        if not press("Tab"):
+            return False
+        if sleep_for(0.5, variation=0.15):
+            return False
+
+        if not press(动作):
+            return False
+        if sleep_for(0.5, variation=0.15):
+            return False
+
+        if not press("Escape"):
+            return False
+        if sleep_for(0.5, variation=0.15):
+            return False
+
+        if 动作跳:
+            if not press("space"):
+                return False
+            if sleep_for(0.5, variation=0.15):
+                return False
+        
+        _maybe_execute_cruise()
+        return not stop_event.is_set()
+
+    def _run_host_once(iteration: int, interval: float) -> bool:
+        log(f"【第{iteration}次】执行动作序列开始...")
+
+        if 防变果冻:
+            if not press("X"):
+                return False
+            if sleep_for(1, variation=0.15):
+                return False
+
+        for key, delay in [("X", 0.5), ("Tab", 0.5), (动作, 0.5), ("Escape", 0.5)]:
+            key_text = 动作 if key == 动作 else key
+            log(f"  按键 [{key_text}]")
+            if not press(key):
+                return False
+            if sleep_for(delay, variation=0.15):
+                return False
+
+        if 动作跳:
+            if not press("space"):
+                return False
+            if sleep_for(2, variation=0.15):
+                return False
+        
+        _maybe_execute_cruise()
+
+        log("  按键 [R]")
+        if not press("R"):
+            return False
+
+        log(f"执行动作序列完成，下次间隔: {interval:.1f}秒")
+        return not stop_event.is_set()
+
+    iteration = 0
+    runner = _run_small_account_once if 任务类型 == "小号做动作" else _run_host_once
+
+    while not stop_event.is_set():
         current_interval = get_random_interval()
-        i = 0
-        log(f"第一次执行动作,需等待 {current_interval:.1f}秒")
-        while not stop_event.is_set():
-            if time.time() - last_time >= current_interval:
-                i += 1
-                log(f"执行动作: 第{i}次按执行动作 [{动作}]，下次间隔: {current_interval:.1f}秒")
-                # log("  按键 [Tab]")
+        log(f"下一次执行等待 {current_interval:.1f}秒")
+        if _wait_or_stop(stop_event, current_interval):
+            break
+        iteration += 1
+        if not runner(iteration, current_interval):
+            break
 
-                humanized_key_press(hwnd, 'Tab')
-                humanized_sleep(0.5, variation=0.15)
 
-                # log(f"  按键 [{动作}]")
-                humanized_key_press(hwnd, 动作)
-                humanized_sleep(0.5, variation=0.15)
-               
-                if stop_event.is_set():
-                    break
-                # log("  按键 [Escape]")
-                humanized_key_press(hwnd, 'Escape')
-                humanized_sleep(0.5, variation=0.15)
+def 时间调整(
+    hwnd,
+    同乘精灵=0,
+    大号同乘=False,
+    释放精灵=False,
+    使用识别释放精灵=True,
+    防果冻=False,
+    置顶识别调整=False,
+    不退出改时间界面=False,
+    log: Logger = None,
+    stop_event: threading.Event = None,
+):
+    if stop_event is None:
+        stop_event = threading.Event()
 
-                humanized_key_press(hwnd, 'space')
-                humanized_sleep(0.5, variation=0.15)
-                last_time = time.time()
-                current_interval = get_random_interval()
-                
-                if 随机巡航:
-                    print("随机巡航")
-                    humanized_sleep(0.2, variation=0.3)
-                    if random.choice(['direction', 'space']) == 'direction':
-                        _execute_direction_cruise()
-                    else:
-                        _execute_space_cruise()
-            humanized_sleep(0.1, variation=0.3)
-    
-    elif 任务类型 == "房主同乘做动作":
-        last_time = time.time()
-        current_interval = get_random_interval()
-        i = 0
-        log(f"第一次执行动作,需等待 {current_interval:.1f}秒")
-        while not stop_event.is_set():
-            if time.time() - last_time >= current_interval:
-                i += 1
-                log(f"【第{i}次】执行动作序列开始...")
-                log("  按键 [X]")
-                humanized_key_press(hwnd, 'X')
-                if stop_event.is_set():
-                    break
-                humanized_sleep(0.5, variation=0.15)
-                
-                log("  按键 [Tab]")
-                humanized_key_press(hwnd, 'Tab')
-                if stop_event.is_set():
-                    break
-                humanized_sleep(0.5, variation=0.15)
-                
-                log(f"  按键 [{动作}]")
-                humanized_key_press(hwnd, 动作)
-                if stop_event.is_set():
-                    break
-                humanized_sleep(0.5, variation=0.15)
-                
-                log("  按键 [Escape]")
-                humanized_key_press(hwnd, 'Escape')
-                if stop_event.is_set():
-                    break
-                humanized_sleep(0.5, variation=0.15)
+    def emit(message: str, color: Optional[str] = None) -> None:
+        _emit_log(log, message, color)
 
-                humanized_key_press(hwnd, 'space')
-                humanized_sleep(0.5, variation=0.15)
-                if 随机巡航:
-                    if random.choice(['direction', 'space']) == 'direction':
-                        _execute_direction_cruise()
-                    else:
-                        _execute_space_cruise()
+    def sleep_for(seconds: float, variation: float = 0.2) -> bool:
+        return humanized_sleep(seconds, variation=variation, stop_event=stop_event)
 
-                log("  按键 [R]")
-                humanized_key_press(hwnd, 'R')
-                if stop_event.is_set():
+    def press(key: str) -> bool:
+        return humanized_key_press(hwnd, key, stop_event=stop_event)
+
+    if 不退出改时间界面 and 释放精灵:
+        释放精灵 = False
+        emit("已关闭退出改时间界面，本次将自动关闭释放精灵流程", color="green")
+
+    if not 不退出改时间界面 and hwnd in _time_adjust_keep_open_hwnds:
+        _time_adjust_keep_open_hwnds.discard(hwnd)
+
+    for _ in range(3):
+        if stop_event.is_set():
+            return
+
+        should_continue_after_adjust = False
+        already_in_time_adjust_ui = 不退出改时间界面 and hwnd in _time_adjust_keep_open_hwnds
+
+        emit(
+            f"游戏时间调整开始，当前模式: {'置顶识别调整' if 置顶识别调整 else '非置顶直操作'}，释放精灵: {'开启' if 释放精灵 else '关闭'}，退出改时间界面: {'关闭' if 不退出改时间界面 else '开启'}"
+        )
+
+        if 置顶识别调整:
+            _ensure_window_topmost(hwnd, log=log)
+            activate_window(hwnd)
+            if sleep_for(1, variation=0.15):
+                return
+            if 防果冻:
+                press("X")
+            if sleep_for(2, variation=0.15):
+                return
+            if already_in_time_adjust_ui:
+                should_continue_after_adjust = True
+                emit("检测到当前窗口已停留在改时间界面，跳过传送石触碰判断")
+            elif _match_template_with_topmost(hwnd, "./img/ff.png", log=log, client_area=True, threshold=0.8)["matched"]:
+                should_continue_after_adjust = True
+                emit("已找到传送石交互按钮，进入置顶识别调整流程")
+
+                press("F")
+                emit("触碰传送石")
+            else:
+                emit("置顶识别调整未找到传送石交互按钮，准备尝试自动调整", color="green")
+
+            if should_continue_after_adjust:
+                while not stop_event.is_set():
+
+                    if sleep_for(2, variation=0.15):
+                        return
+                    if _match_template_with_topmost(hwnd, "./img/xmsj.png", log=log, client_area=True, threshold=0.8)["matched"]:
+                        press("1")
+                        emit("选择调整时间")
+                        if sleep_for(1, variation=0.15):
+                            return
+
+                    if _match_template_with_topmost(hwnd, "./img/zt.png", log=log, client_area=True, threshold=0.8)["matched"]:
+                        press("Tab")
+                        emit("开启/关闭自动播放")
+                        if sleep_for(1, variation=0.15):
+                            return
+
+                    if _match_template_with_topmost(hwnd, "./img/zs.png", log=log, client_area=True, threshold=0.8)["matched"]:
+                        press("1")
+                        emit("选择早上")
+                        if 不退出改时间界面:
+                            _time_adjust_keep_open_hwnds.add(hwnd)
+                            emit("按配置不退出改时间界面")
+                        else:
+                            while not stop_event.is_set():
+                                if sleep_for(1, variation=0.15):
+                                    return
+                                if _match_template_with_topmost(hwnd, "./img/tc.png", log=log, client_area=True, threshold=0.8)["matched"]:
+                                    press("2")
+                                    emit("退出")
+                                    _time_adjust_keep_open_hwnds.discard(hwnd)
+                                    break
+                            if sleep_for(2, variation=0.15):
+                                return
+                        break
+        else:
+            emit("未开启置顶识别调整，按固定步骤直接操作窗口")
+            if not already_in_time_adjust_ui and not 不退出改时间界面:
+                emit("触碰传送石")
+
+            if not already_in_time_adjust_ui:
+                press("F")
+                if sleep_for(10, variation=0.15):
+                    return
+            else:
+                emit("检测到当前窗口已停留在改时间界面，跳过传送石触碰步骤")
+
+            press("1")
+            emit("选择调整时间")
+            if sleep_for(3, variation=0.15):
+                return
+
+            press("Tab")
+            emit("开启/关闭自动播放")
+            if sleep_for(5, variation=0.15):
+                return 
+            
+            press("1")
+            emit("选择早上")
+            if sleep_for(10, variation=0.15):
+                return
+
+            if not 不退出改时间界面:
+                press("2")
+                emit("退出")
+                _time_adjust_keep_open_hwnds.discard(hwnd)
+                if sleep_for(5, variation=0.15):
+                    return
+            else:
+                _time_adjust_keep_open_hwnds.add(hwnd)
+                emit("按配置不退出改时间界面")
+
+            should_continue_after_adjust = True
+
+        if should_continue_after_adjust:
+            matcher = _match_template_with_topmost if 置顶识别调整 else _match_template_direct
+
+            if 释放精灵:
+                release_mode = "识别释放" if 使用识别释放精灵 else "非识别释放"
+                if 使用识别释放精灵:
+                    emit(f"释放精灵流程开始，模式: {release_mode}，识别方式: {'置顶识别' if 置顶识别调整 else '非置顶识别'}")
+                else:
+                    emit(f"释放精灵流程开始，模式: {release_mode}", color="green")
+
+
+            while 释放精灵 and not stop_event.is_set():
+                if 置顶识别调整:
+                    _ensure_window_topmost(hwnd, log=log)
+                    activate_window(hwnd)
+                if sleep_for(1, variation=0.15):
+                    return
+                if not 使用识别释放精灵:
+                    activate_window(hwnd)
+                    for i in range(1, 7):
+                        if i == 同乘精灵:
+                            emit(f"跳过{i}号骑乘精灵")
+                            if sleep_for(1, variation=0.15):
+                                return
+                            continue
+                        if sleep_for(1, variation=0.15):
+                            return
+                        if 防果冻:
+                            press("X")
+                        if sleep_for(2, variation=0.15):
+                            return
+                        emit(f"执行非识别释放: {i}号精灵")
+                        press(str(i))
+                        if sleep_for(2, variation=0.15):
+                            return
+                        click_mouse(hwnd, 0, 0, "left", stop_event=stop_event)
+
+                    emit("非识别释放精灵流程完成", color="green")
                     break
-                
-                log(f"执行动作序列完成，下次间隔: {current_interval:.1f}秒")
-                last_time = time.time()
-                current_interval = get_random_interval()
-                
+                cw_regions = [(50, 57, 47, 35), (50, 100, 47, 35), (50, 140, 100, 30), (50, 179, 47, 35), (50, 219, 47, 35), (50, 262, 47, 35)]
+                for i in range(1, 7):
+                    activate_window(hwnd)
+                    if i == 同乘精灵:
+                        emit(f"跳过{i}号骑乘精灵")
+                        if sleep_for(1, variation=0.15):
+                            return
+                        continue
+                    c = 0                  
+                    while not stop_event.is_set():
+                        if c > 2:
+                            emit(f"{i}号精灵识别释放未命中，已达到最大尝试次数", color="green")
+                            break
+                        matched = matcher(
+                            hwnd,
+                            "./img/shifang.png",
+                            region=cw_regions[i - 1],
+                            client_area=True,
+                            threshold=0.8,
+                        )["matched"]
+                        if matched:
+                            emit(f"成功释放{i}号精灵")
+                            break
+                        if 防果冻:
+                            press("X")
+                        if sleep_for(2, variation=0.15):
+                            return
+                        emit(f"尝试识别释放{i}号精灵，第{c + 1}次")
+                        press(str(i))
+                        if sleep_for(2, variation=0.15):
+                            return
+                        click_mouse(hwnd, 0, 0, "left", stop_event=stop_event)
+                        if sleep_for(3, variation=0.15):
+                            return
+                        c += 1
+                emit("识别释放精灵流程完成", color="green")
+                break
+
+            if 大号同乘:
+                emit(f"大号同乘流程开始，识别方式: {'置顶识别' if 置顶识别调整 else '非置顶识别'}")
+
+            while 大号同乘 and not stop_event.is_set():
+                if sleep_for(2, variation=0.15):
+                    return
+                if matcher(hwnd, "./img/zjm.png", client_area=True, threshold=0.8)["matched"]:
+                    press(str(同乘精灵))
+                    emit(f"选择同乘精灵{同乘精灵}")
+                    if sleep_for(2, variation=0.15):
+                        return
+                    press("R")
+                    break
+                if sleep_for(2, variation=0.15):
+                    return
+
+            emit("游戏时间调整流程执行完成")
+            deactivate_window(hwnd)
+            sleep_for(7, variation=0.15)
+            return
+
+        emit("未找到传送石触碰按钮，无法调整时间！！！自动调整中", color="green")
+        _long_press_key(hwnd, "A", 0.1, stop_event)
+
+    emit("未找到传送石触碰按钮，无法调整时间！！！请手动调整", color="red")
+
+
+def 月卡关闭(
+    hwnd,
+    target_minute=1,
+    stop_event: threading.Event = None,
+    log: Logger = None,
+):
+    """
+    每天在 04:01-04:05 的指定时间执行一次月卡关闭点击。
+    """
+    if stop_event is None:
+        stop_event = threading.Event()
+
+    if target_minute < 1 or target_minute > 5:
+        raise ValueError("月卡关闭时间仅支持 04:01-04:05，请传入 1-5 的分钟值")
+
+    def emit(message: str, color: Optional[str] = None) -> None:
+        _emit_log(log, message, color)
+
+    emit(f"月卡关闭已启用，将在每天 04:{target_minute:02d} 自动执行", color="green")
+    last_trigger_date = None
+
+    while not stop_event.is_set():
+        now = datetime.now()
+        today_target = now.replace(hour=4, minute=target_minute, second=0, microsecond=0)
+
+        if now.hour == 4 and now.minute == target_minute and last_trigger_date != now.date():
+            try:
+                emit(f"到达月卡关闭时间 04:{target_minute:02d}，开始执行前台点击", color="green")
+                activate_window(hwnd)
+                if humanized_sleep(0.2, variation=0.1, stop_event=stop_event):
+                    return
+                click_mouse(hwnd, 0, 0, "left", stop_event=stop_event)
+                deactivate_window(hwnd)
+                emit("月卡关闭点击完成", color="green")
+            except Exception as exc:
+                emit(f"月卡关闭执行失败: {exc}", color="red")
+            last_trigger_date = now.date()
+            continue
+
+        if now < today_target:
+            next_run = today_target
+        else:
+            next_run = today_target + timedelta(days=1)
+
+        _wait_or_stop(stop_event, min((next_run - now).total_seconds(), 1.0))

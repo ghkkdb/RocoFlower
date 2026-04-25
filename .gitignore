@@ -1,5 +1,6 @@
 # Python
 __pycache__/
+.venv-slim/
 *.py[cod]
 *$py.class
 *.so
@@ -25,6 +26,7 @@ wheels/
 *.build/
 *.dist/
 nuitka_cache/
+nuitka_cache_slim/
 nuitka-crash-report.xml
 
 # MinGW工具链

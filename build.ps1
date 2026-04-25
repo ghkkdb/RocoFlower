@@ -3,7 +3,8 @@
 
 param(
     [switch]$Clean = $false,
-    [switch]$Verbose = $false
+    [switch]$Verbose = $false,
+    [switch]$Onefile = $false
 )
 
 $ErrorActionPreference = "Stop"
@@ -12,6 +13,7 @@ $OutputFileName = "RocoFlower.exe"
 $IconFile = "favicon.ico"
 $EntryPoint = "main_window.py"
 $CacheDir = Join-Path $ProjectRoot "nuitka_cache"
+$UpxDir = "C:\Users\Administrator\AppData\Local\Microsoft\WinGet\Packages\UPX.UPX_Microsoft.Winget.Source_8wekyb3d8bbwe\upx-5.1.1-win64"
 
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "  RocoFlower Nuitka Build Script" -ForegroundColor Cyan
@@ -22,8 +24,9 @@ if ($Clean) {
     Write-Host "[Clean] Removing old build files..." -ForegroundColor Yellow
     $buildDirs = @(
         "main_window.build",
-        "main_window.dist", 
-        "main_window.onefile-build"
+        "main_window.dist",
+        "main_window.onefile-build",
+        $OutputFileName
     )
     foreach ($dir in $buildDirs) {
         $path = Join-Path $ProjectRoot $dir
@@ -57,38 +60,75 @@ $env:NUITKA_CACHE_DIR = $CacheDir
 Write-Host "[Env] Setting cache directory: $CacheDir" -ForegroundColor Green
 Write-Host ""
 
+if (Test-Path $UpxDir) {
+    $env:PATH = "$UpxDir;$env:PATH"
+    Write-Host "[Env] UPX detected: $UpxDir" -ForegroundColor Green
+    Write-Host ""
+}
+
+$outputPath = Join-Path $ProjectRoot $OutputFileName
+if (Test-Path $outputPath) {
+    Write-Host "[Clean] Removing previous output: $OutputFileName" -ForegroundColor Yellow
+    try {
+        Remove-Item -Path $outputPath -Force
+    } catch {
+        Write-Host "[Error] Failed to remove existing output. Close any running copy of $OutputFileName and try again." -ForegroundColor Red
+        exit 1
+    }
+    Write-Host ""
+}
+
 Write-Host "[Build] Starting Nuitka compilation..." -ForegroundColor Green
 Write-Host ""
 
 $nuitkaArgs = @(
     "-m", "nuitka",
     "--standalone",
-    "--onefile",
     "--windows-console-mode=disable",
     "--windows-icon-from-ico=$IconFile",
     "--enable-plugin=pyqt5",
-    "--output-filename=$OutputFileName",
     "--assume-yes-for-downloads",
+    "--lto=yes",
+    "--jobs=1",
+    "--python-flag=no_docstrings",
     "--nofollow-import-to=tkinter",
     "--nofollow-import-to=unittest",
     "--nofollow-import-to=test",
     "--nofollow-import-to=tests",
-    "--nofollow-import-to=email",
-    "--nofollow-import-to=html",
-    "--nofollow-import-to=xml",
-    "--nofollow-import-to=xmlrpc",
-    "--nofollow-import-to=multiprocessing",
-    "--nofollow-import-to=concurrent",
-    "--nofollow-import-to=asyncio",
-    "--nofollow-import-to=distutils",
     "--nofollow-import-to=setuptools",
     "--nofollow-import-to=pip",
-    "--nofollow-import-to=site-packages",
+    "--nofollow-import-to=pandas",
+    "--nofollow-import-to=matplotlib",
+    "--nofollow-import-to=scipy",
+    "--nofollow-import-to=PIL",
+    "--include-module=pythoncom",
+    "--include-module=pywintypes",
+    "--include-module=win32com.client",
     "--include-module=win32gui",
     "--include-module=win32con",
     "--include-module=win32api",
+    "--include-module=win32ui",
+    "--include-data-dir=img=img",
+    "--noinclude-dlls=qt5network_conda.dll",
+    "--noinclude-dlls=qt5pdf_conda.dll",
+    "--noinclude-dlls=qt5quick_conda.dll",
+    "--noinclude-dlls=qt5qml_conda.dll",
+    "--noinclude-dlls=qt5qmlmodels_conda.dll",
+    "--noinclude-dlls=qt5websockets_conda.dll",
+    "--noinclude-dlls=qt5multimedia_conda.dll",
+    "--noinclude-dlls=qt5printsupport_conda.dll",
+    "--noinclude-dlls=qt5svg_conda.dll",
+    "--noinclude-dlls=qt5dbus_conda.dll",
     $EntryPoint
 )
+
+if ($Onefile) {
+    $nuitkaArgs += "--onefile"
+    $nuitkaArgs += "--enable-plugin=upx"
+    $nuitkaArgs += "--output-filename=$OutputFileName"
+} else {
+    $nuitkaArgs += "--output-filename=$OutputFileName"
+}
 
 if ($Verbose) {
     $nuitkaArgs += "--show-progress"
@@ -109,7 +149,7 @@ $endTime = Get-Date
 $duration = $endTime - $startTime
 
 if ($exitCode -eq 0) {
-    $exePath = Join-Path $ProjectRoot $OutputFileName
+    $exePath = if ($Onefile) { $outputPath } else { Join-Path $ProjectRoot "main_window.dist\$OutputFileName" }
     if (Test-Path $exePath) {
         $fileSize = (Get-Item $exePath).Length / 1MB
         Write-Host ""
@@ -123,7 +163,11 @@ if ($exitCode -eq 0) {
         Write-Host ""
         
         Write-Host "[Clean] Removing temporary build directories..." -ForegroundColor Yellow
-        $tempDirs = @("main_window.build", "main_window.dist", "main_window.onefile-build")
+        $tempDirs = @("main_window.build")
+        if ($Onefile) {
+            $tempDirs += "main_window.onefile-build"
+            $tempDirs += "main_window.dist"
+        }
         foreach ($dir in $tempDirs) {
             $path = Join-Path $ProjectRoot $dir
             if (Test-Path $path) {

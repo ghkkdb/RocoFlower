@@ -156,7 +156,7 @@ class DragWindowPicker(QObject):
         """设置信号槽连接。"""
         self.button.released_at.connect(self._on_button_released)
         self.picker.window_picked.connect(self._on_window_picked)
-        self.picker.pick_failed.connect(self.pick_failed.emit)
+        self.picker.pick_failed.connect(self._on_pick_failed)
         self.picker.pick_status.connect(self.pick_status.emit)
 
     def _on_button_released(self, x: int, y: int):
@@ -177,6 +177,10 @@ class DragWindowPicker(QObject):
         """
         self.button.setEnabled(True)
         self.window_picked.emit(hwnd)
+
+    def _on_pick_failed(self):
+        self.button.setEnabled(True)
+        self.pick_failed.emit()
 
     def set_target_class_name(self, class_name: str):
         """

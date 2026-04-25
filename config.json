@@ -1,19 +1,7 @@
 {
-  "task_type": "房主同乘做动作",
-  "action_key": "2",
-  "interval_min": 8,
-  "interval_max": 10,
-  "duration": 60000,
-  "auto_shutdown": false,
-  "window_width": 1280,
-  "window_height": 720,
-  "window_x": 0,
-  "window_y": 0,
-  "force_topmost": false,
-  "random_cruise": true,
-  "cruise_probability": 22,
-  "cruise_hold_min": 0.0,
-  "cruise_hold_max": 0.0,
-  "cruise_space_min": 0,
-  "cruise_space_max": 1
+  "hotkeys": {
+    "start": "Ctrl+Alt+S",
+    "stop": "Ctrl+Alt+X"
+  },
+  "window_profiles": {}
 }

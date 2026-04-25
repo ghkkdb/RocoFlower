@@ -1,1194 +1,1212 @@
-"""
-项目主窗口GUI模块。
-
-提供图形用户界面，包含窗口选择、任务控制、配置选项和日志显示功能。
-"""
-import sys
-import os
+﻿import copy
+import ctypes
+import ctypes.wintypes
 import json
+import os
+import sys
 import threading
 import time
-import ctypes
-from datetime import datetime, timedelta
+import webbrowser
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from PyQt5.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QRadioButton, QButtonGroup,
-    QGroupBox, QTextEdit, QComboBox, QSpinBox, QApplication,
-    QCheckBox, QMessageBox, QDialog, QLineEdit, QDoubleSpinBox
-)
-from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QMetaObject, Q_ARG, pyqtSlot
-from PyQt5.QtGui import QTextCursor
+from typing import Dict, Optional, Tuple
+import random
 
-import win32gui
 import win32con
+import win32gui
+from PyQt5.QtCore import Q_ARG, QMetaObject, QTimer, Qt, pyqtSignal, pyqtSlot
+from PyQt5.QtGui import QColor, QKeySequence, QTextCharFormat, QTextCursor
+from PyQt5.QtWidgets import (
+    QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
+    QGroupBox, QHBoxLayout, QKeySequenceEdit, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem, QMainWindow, QMessageBox, QPushButton, QRadioButton, QSizePolicy, QSpinBox,
+    QTextEdit, QVBoxLayout, QWidget,
+)
 
+from auth import check_license
 from drag_window_picker import DragWindowPicker
-from task import task_1
-from auth import check_license, get_machine_id
+from task import task_1, 月卡关闭, 时间调整
+
+MOD_ALT = 0x0001
+MOD_CONTROL = 0x0002
+MOD_SHIFT = 0x0004
+MOD_WIN = 0x0008
+HOTKEY_ID_START = 0x5001
+HOTKEY_ID_STOP = 0x5002
+TASK_TYPE_SMALL = "小号做动作"
+TASK_TYPE_HOST = "房主同乘做动作"
+TASK_TYPE_TIME_ADJUST = "游戏时间调整"
 
 
 def get_app_dir() -> Path:
-    """
-    获取应用程序目录路径，兼容打包后的exe。
-    Returns:
-        Path: 应用程序所在目录
-    """
-    if getattr(sys, 'frozen', False) or hasattr(sys, 'frozen'):
+    if getattr(sys, "frozen", False) or hasattr(sys, "frozen"):
         try:
             buf = ctypes.create_unicode_buffer(260)
             ctypes.windll.kernel32.GetModuleFileNameW(None, buf, 260)
             return Path(buf.value).parent
         except Exception:
             pass
-    try:
-        buf = ctypes.create_unicode_buffer(260)
-        ctypes.windll.kernel32.GetModuleFileNameW(None, buf, 260)
-        exe_path = Path(buf.value)
-        if exe_path.suffix.lower() == '.exe':
-            return exe_path.parent
-    except Exception:
-        pass
     return Path(__file__).parent
 
 
 def get_config_file_path() -> Path:
-    """
-    获取配置文件路径。
-    Returns:
-        Path: 配置文件完整路径
-    """
     return get_app_dir() / "config.json"
 
 
+def _minutes_to_minute_second_parts(total_minutes: float) -> Tuple[int, int]:
+    total_seconds = max(0, int(round(float(total_minutes) * 60)))
+    return total_seconds // 60, total_seconds % 60
+
+
+def _minute_second_parts_to_minutes(minutes: int, seconds: int) -> float:
+    total_seconds = max(0, int(minutes) * 60 + int(seconds))
+    return total_seconds / 60.0
+
+
+@dataclass
+class WindowProfile:
+    task_type: str = TASK_TYPE_SMALL
+    action_key: str = "2"
+    interval_min: int = 8
+    interval_max: int = 9
+    duration: int = 60000
+    time_adjust_interval_min: float = 15.0
+    time_adjust_interval_max: float = 21.0
+    time_adjust_release_pet: bool = False
+    time_adjust_use_release_pet_recognition: bool = False
+    time_adjust_anti_jelly: bool = False
+    time_adjust_topmost_recognition: bool = False
+    time_adjust_keep_open: bool = False
+    auto_shutdown: bool = False
+    window_width: int = 1000
+    window_height: int = 600
+    window_x: int = 0
+    window_y: int = 0
+    force_topmost: bool = False
+    anti_jelly: bool = True
+    random_cruise: bool = False
+    cruise_probability: int = 22
+    cruise_hold_min: float = 0.2
+    cruise_hold_max: float = 0.4
+    cruise_space_min: int = 0
+    cruise_space_max: int = 1
+    action_jump: bool = True
+    monthly_card_close_enabled: bool = False
+    monthly_card_minute: int = 1
+    window_title: str = ""
+    window_class: str = ""
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "WindowProfile":
+        p = cls()
+        for k in p.__dataclass_fields__:
+            if k in d:
+                setattr(p, k, d[k])
+        if "time_adjust_interval_minutes" in d:
+            p.time_adjust_interval_min = d["time_adjust_interval_minutes"]
+            p.time_adjust_interval_max = d["time_adjust_interval_minutes"]
+        if d.get("time_adjust_enabled"):
+            p.task_type = TASK_TYPE_TIME_ADJUST
+        p.normalize()
+        return p
+
+    def to_dict(self) -> dict:
+        self.normalize()
+        return {k: getattr(self, k) for k in self.__dataclass_fields__}
+
+    def normalize(self):
+        if self.task_type not in (TASK_TYPE_SMALL, TASK_TYPE_HOST, TASK_TYPE_TIME_ADJUST):
+            self.task_type = TASK_TYPE_SMALL
+        self.action_key = str(self.action_key)
+        if self.action_key not in {"1", "2", "3", "4", "5"}:
+            self.action_key = "2"
+        self.interval_min = max(1, int(self.interval_min))
+        self.interval_max = max(1, int(self.interval_max))
+        if self.interval_min > self.interval_max:
+            self.interval_min, self.interval_max = self.interval_max, self.interval_min
+        self.duration = max(1, int(self.duration))
+        self.time_adjust_interval_min = max(0.1, min(25.0, float(self.time_adjust_interval_min)))
+        self.time_adjust_interval_max = max(0.1, min(25.0, float(self.time_adjust_interval_max)))
+        if self.time_adjust_interval_min > self.time_adjust_interval_max:
+            self.time_adjust_interval_min, self.time_adjust_interval_max = self.time_adjust_interval_max, self.time_adjust_interval_min
+        self.window_width = max(400, int(self.window_width))
+        self.window_height = max(300, int(self.window_height))
+        self.window_x = max(0, int(self.window_x))
+        self.window_y = max(0, int(self.window_y))
+        self.cruise_probability = min(100, max(1, int(self.cruise_probability)))
+        self.cruise_hold_min = float(self.cruise_hold_min)
+        self.cruise_hold_max = float(self.cruise_hold_max)
+        if self.cruise_hold_min > self.cruise_hold_max:
+            self.cruise_hold_min, self.cruise_hold_max = self.cruise_hold_max, self.cruise_hold_min
+        self.cruise_space_min = max(0, int(self.cruise_space_min))
+        self.cruise_space_max = max(0, int(self.cruise_space_max))
+        if self.cruise_space_min > self.cruise_space_max:
+            self.cruise_space_min, self.cruise_space_max = self.cruise_space_max, self.cruise_space_min
+        self.monthly_card_minute = min(5, max(1, int(self.monthly_card_minute)))
+
+
+@dataclass
+class WindowSession:
+    stop_event: threading.Event
+    task_thread: threading.Thread
+    monthly_thread: Optional[threading.Thread]
+    end_monotonic: float
+    running: bool = True
+
+
 class LicenseDialog(QDialog):
-    """
-    授权验证对话框。
-    
-    显示机器码并提示用户获取授权。
-    """
-    
     def __init__(self, result: str, parent=None):
-        """
-        初始化授权对话框。
-        Args:
-            result: 授权验证结果，可能包含错误类型前缀
-            parent: 父窗口
-        """
         super().__init__(parent)
         self.setWindowTitle("授权验证")
         self.setFixedSize(400, 220)
-        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
-        
         layout = QVBoxLayout(self)
-        layout.setSpacing(15)
-        
-        error_type = None
         machine_id = result
-        
         if result.startswith("ERROR:"):
-            error_type = "ERROR"
-            error_msg = result[6:]
-            info_label = QLabel(f"系统环境异常，无法验证授权：\n\n{error_msg}")
-            info_label.setWordWrap(True)
-            info_label.setStyleSheet("color: #D32F2F;")
-            layout.addWidget(info_label)
-            
-            self.machine_id_edit = None
-            btn_layout = QHBoxLayout()
-            btn_layout.addStretch()
-            close_btn = QPushButton("关闭")
-            close_btn.setFixedWidth(80)
-            close_btn.clicked.connect(self.reject)
-            btn_layout.addWidget(close_btn)
-            layout.addLayout(btn_layout)
-            return
-            
+            info = f"系统环境异常，无法验证授权：\n\n{result[6:]}"
+            machine_id = ""
         elif result.startswith("FORMAT:"):
-            error_type = "FORMAT"
+            info = "授权文件格式错误，请重新获取授权文件："
             machine_id = result[7:]
-            info_text = "授权文件格式错误，请重新获取授权文件："
-            
         elif result.startswith("SIGNATURE:"):
-            error_type = "SIGNATURE"
+            info = "授权文件签名无效，请重新获取授权文件："
             machine_id = result[10:]
-            info_text = "授权文件签名无效（可能被篡改），请重新获取授权文件："
-            
         else:
-            info_text = "程序未授权，请将以下机器码发送给开发者获取授权文件："
-        
-        info_label = QLabel(info_text)
-        info_label.setWordWrap(True)
-        if error_type:
-            info_label.setStyleSheet("color: #D32F2F;")
-        else:
-            info_label.setStyleSheet("color: #333;")
-        layout.addWidget(info_label)
-        
-        self.machine_id_edit = QLineEdit(machine_id)
-        self.machine_id_edit.setAlignment(Qt.AlignCenter)
-        self.machine_id_edit.setReadOnly(True)
-        self.machine_id_edit.setStyleSheet("""
-            QLineEdit {
-                font-family: 'Consolas', 'Courier New', monospace;
-                font-size: 18px;
-                font-weight: bold;
-                padding: 8px;
-                background-color: #f5f5f5;
-                border: 2px solid #ddd;
-                border-radius: 4px;
-            }
-        """)
-        layout.addWidget(self.machine_id_edit)
-        
-        btn_layout = QHBoxLayout()
-        btn_layout.addStretch()
-        
-        copy_btn = QPushButton("复制机器码")
-        copy_btn.setFixedWidth(100)
-        copy_btn.clicked.connect(self._copy_machine_id)
-        btn_layout.addWidget(copy_btn)
-        
-        close_btn = QPushButton("关闭")
-        close_btn.setFixedWidth(80)
-        close_btn.clicked.connect(self.reject)
-        btn_layout.addWidget(close_btn)
-        
-        layout.addLayout(btn_layout)
-    
-    def _copy_machine_id(self):
-        """复制机器码到剪贴板。"""
+            info = "程序未授权，点击下方“获取收取文件”按钮获取授权文件！！！"
+        layout.addWidget(QLabel(info))
+        self.machine_id_edit = None
+        if machine_id:
+            self.machine_id_edit = QLineEdit(machine_id)
+            self.machine_id_edit.setReadOnly(True)
+            self.machine_id_edit.setAlignment(Qt.AlignCenter)
+            layout.addWidget(self.machine_id_edit)
+        row = QHBoxLayout(); row.addStretch()
         if self.machine_id_edit:
-            clipboard = QApplication.clipboard()
-            clipboard.setText(self.machine_id_edit.text())
-            QMessageBox.information(self, "提示", "机器码已复制到剪贴板")
+            b = QPushButton("复制机器码")
+            b.clicked.connect(self._copy)
+            row.addWidget(b)
+        g = QPushButton("获取授权文件")
+        g.clicked.connect(self._open_license_page)
+        row.addWidget(g)
+        c = QPushButton("关闭")
+        c.clicked.connect(self.reject)
+        row.addWidget(c)
+        layout.addLayout(row)
+
+    def _copy(self):
+        QApplication.clipboard().setText(self.machine_id_edit.text())
+        QMessageBox.information(self, "提示", "机器码已复制")
+
+    def _open_license_page(self):
+        webbrowser.open("https://m.tb.cn/h.imqLQmn")
 
 
 class ShutdownConfirmDialog(QDialog):
-    """
-    关机确认对话框。
-    
-    显示倒计时，用户可选择立即关机或取消。
-    2分钟无操作则自动关机。
-    """
-    
     def __init__(self, parent=None):
-        """
-        初始化关机确认对话框。
-        Args:
-            parent: 父窗口
-        """
         super().__init__(parent)
         self.setWindowTitle("关机确认")
-        self.setFixedSize(400, 200)
-        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
-        
-        self._countdown_seconds = 120
-        self._shutdown_triggered = False
-        
+        self._sec = 120
+        self._done = False
         layout = QVBoxLayout(self)
-        layout.setSpacing(15)
-        
-        self.info_label = QLabel("任务已完成，是否确认关机？")
-        self.info_label.setStyleSheet("font-size: 16px; font-weight: bold;")
-        self.info_label.setAlignment(Qt.AlignCenter)
-        layout.addWidget(self.info_label)
-        
-        self.countdown_label = QLabel(f"倒计时: {self._countdown_seconds} 秒")
-        self.countdown_label.setStyleSheet("font-size: 14px; color: #d32f2f;")
-        self.countdown_label.setAlignment(Qt.AlignCenter)
-        layout.addWidget(self.countdown_label)
-        
-        self.hint_label = QLabel("2分钟内无操作将自动关机")
-        self.hint_label.setStyleSheet("color: gray;")
-        self.hint_label.setAlignment(Qt.AlignCenter)
-        layout.addWidget(self.hint_label)
-        
-        btn_layout = QHBoxLayout()
-        
-        self.shutdown_btn = QPushButton("立即关机")
-        self.shutdown_btn.setFixedWidth(120)
-        self.shutdown_btn.clicked.connect(self._on_shutdown_now)
-        btn_layout.addWidget(self.shutdown_btn)
-        
-        btn_layout.addStretch()
-        
-        self.cancel_btn = QPushButton("取消关机")
-        self.cancel_btn.setFixedWidth(100)
-        self.cancel_btn.clicked.connect(self._on_cancel)
-        btn_layout.addWidget(self.cancel_btn)
-        
-        layout.addLayout(btn_layout)
-        
-        self._timer = QTimer(self)
-        self._timer.timeout.connect(self._update_countdown)
-        self._timer.start(1000)
-    
-    def _update_countdown(self):
-        """更新倒计时。"""
-        self._countdown_seconds -= 1
-        self.countdown_label.setText(f"倒计时: {self._countdown_seconds} 秒")
-        
-        if self._countdown_seconds <= 0:
-            self._timer.stop()
-            self._execute_shutdown()
-    
-    def _on_shutdown_now(self):
-        """立即关机。"""
-        self._timer.stop()
-        self._execute_shutdown()
-    
-    def _on_cancel(self):
-        """取消关机。"""
-        self._timer.stop()
-        self.reject()
-    
-    def _execute_shutdown(self):
-        """执行关机。"""
-        if self._shutdown_triggered:
+        layout.addWidget(QLabel("任务已完成，是否确认关机？"))
+        self.label = QLabel("倒计时: 120 秒")
+        layout.addWidget(self.label)
+        row = QHBoxLayout()
+        a = QPushButton("立即关机"); a.clicked.connect(self._shutdown); row.addWidget(a)
+        row.addStretch()
+        b = QPushButton("取消"); b.clicked.connect(self.reject); row.addWidget(b)
+        layout.addLayout(row)
+        self.t = QTimer(self)
+        self.t.timeout.connect(self._tick)
+        self.t.start(1000)
+
+    def _tick(self):
+        self._sec -= 1
+        self.label.setText(f"倒计时: {self._sec} 秒")
+        if self._sec <= 0:
+            self._shutdown()
+
+    def _shutdown(self):
+        if self._done:
             return
-        self._shutdown_triggered = True
-        
-        try:
-            os.system("shutdown /s /t 60")
-        except Exception:
-            pass
-        
+        self._done = True
+        self.t.stop()
+        os.system("shutdown /s /t 60")
         self.accept()
 
 
 class MainWindow(QMainWindow):
-    """
-    项目主窗口类。
-    
-    信号：
-        start_clicked: 开始按钮点击时触发
-        stop_clicked: 停止按钮点击时触发
-    """
-    
     start_clicked = pyqtSignal()
     stop_clicked = pyqtSignal()
-    
+
     def __init__(self, target_class_name: str = "UnrealWindow"):
-        """
-        初始化主窗口。
-        Args:
-            target_class_name: 目标窗口类名
-        """
         super().__init__()
-        
         self._target_class_name = target_class_name
-        self._bound_hwnd: int = 0
-        self._is_running: bool = False
-        
-        self._task_thread: threading.Thread = None
-        self._stop_event: threading.Event = threading.Event()
-        
-        self._start_time: datetime = None
-        self._remaining_seconds: int = 0
-        
+        self._profiles: Dict[int, WindowProfile] = {}
+        self._sessions: Dict[int, WindowSession] = {}
+        self._selected_hwnd: Optional[int] = None
+        self._loading_profile = False
+        self._legacy_default = WindowProfile()
+        self._start_hotkey_seq = QKeySequence("Ctrl+Alt+S")
+        self._stop_hotkey_seq = QKeySequence("Ctrl+Alt+X")
+
         self._init_ui()
         self._connect_signals()
-        
-        self._countdown_timer = QTimer(self)
-        self._countdown_timer.timeout.connect(self._update_countdown)
-        
+        self._ui_timer = QTimer(self)
+        self._ui_timer.timeout.connect(self._on_ui_tick)
+        self._ui_timer.start(100)
         self.load_config()
-    
+        self._register_hotkeys()
+        self._refresh_control_state()
+
     def _init_ui(self):
-        """初始化用户界面。"""
-        self.setWindowTitle("RocoFlower V2.4.5")
-        self.setMinimumSize(700, 600)
-        self.resize(800, 700)
-        
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        
-        main_layout = QVBoxLayout(central_widget)
-        main_layout.setSpacing(10)
-        main_layout.setContentsMargins(10, 10, 10, 10)
-        
-        top_layout = QHBoxLayout()
-        top_layout.addWidget(self._create_window_picker_group())
-        top_layout.addWidget(self._create_control_group())
-        main_layout.addLayout(top_layout)
-        
-        main_layout.addWidget(self._create_config_group())
-        
-        main_layout.addWidget(self._create_window_control_group())
-        
-        main_layout.addWidget(self._create_log_group(), 1)
-    
+        self.setWindowTitle("RocoFlower V2.5.3")
+        self.resize(800, 760)
+        root = QWidget(); self.setCentralWidget(root)
+        main = QVBoxLayout(root)
+
+        top = QHBoxLayout()
+        top.addWidget(self._create_window_picker_group(), 2)
+        right = QVBoxLayout()
+        right.addWidget(self._create_group_info_group())
+        right.addWidget(self._create_control_group())
+        top.addLayout(right, 3)
+        main.addLayout(top)
+        main.addWidget(self._create_config_group())
+        main.addWidget(self._create_window_control_group())
+        main.addWidget(self._create_log_group(), 1)
     def _create_window_picker_group(self) -> QGroupBox:
-        """
-        创建窗口选择区域。
-        Returns:
-            QGroupBox: 窗口选择分组框
-        """
-        group = QGroupBox("窗口选择")
-        layout = QHBoxLayout(group)
-        
-        self.window_picker = DragWindowPicker(
-            target_class_name=self._target_class_name
-        )
-        layout.addWidget(self.window_picker.get_button())
-        
-        self.unbind_btn = QPushButton("解绑")
-        self.unbind_btn.setMinimumWidth(60)
+        g = QGroupBox("窗口绑定")
+        g.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        g.setMaximumHeight(210)
+        v = QVBoxLayout(g)
+        h = QHBoxLayout()
+        self.window_picker = DragWindowPicker(target_class_name=self._target_class_name)
+        h.addWidget(self.window_picker.get_button())
+        self.unbind_btn = QPushButton("解绑选中")
         self.unbind_btn.setEnabled(False)
-        layout.addWidget(self.unbind_btn)
-        
-        self.window_status_label = QLabel("未绑定窗口")
+        h.addWidget(self.unbind_btn)
+        self.bound_count_label = QLabel("已绑定: 0")
+        h.addWidget(self.bound_count_label)
+        h.addStretch()
+        v.addLayout(h)
+        self.bound_windows_list = QListWidget()
+        self.bound_windows_list.setMinimumHeight(110)
+        self.bound_windows_list.setMaximumHeight(125)
+        v.addWidget(self.bound_windows_list)
+        self.window_status_label = QLabel("未选择世界")
         self.window_status_label.setStyleSheet("color: gray;")
-        layout.addWidget(self.window_status_label)
-        
-        layout.addStretch()
-        
-        return group
-    
+        v.addWidget(self.window_status_label)
+        return g
+
     def _create_control_group(self) -> QGroupBox:
-        """
-        创建控制按钮区域。
-        Returns:
-            QGroupBox: 控制按钮分组框
-        """
-        group = QGroupBox("控制")
-        layout = QHBoxLayout(group)
-        
-        self.start_btn = QPushButton("开始")
-        self.start_btn.setMinimumWidth(80)
-        self.start_btn.setEnabled(False)
-        layout.addWidget(self.start_btn)
-        
-        self.stop_btn = QPushButton("停止")
-        self.stop_btn.setMinimumWidth(80)
-        self.stop_btn.setEnabled(False)
-        layout.addWidget(self.stop_btn)
-        
-        layout.addSpacing(20)
-        
-        layout.addWidget(QLabel("剩余时间:"))
+        g = QGroupBox("控制")
+        g.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        g.setMaximumHeight(140)
+        v = QVBoxLayout(g)
+        r1 = QHBoxLayout()
+        self.start_btn = QPushButton("开始(全部窗口)")
+        self.stop_btn = QPushButton("停止(全部窗口)")
+        r1.addWidget(self.start_btn); r1.addWidget(self.stop_btn)
+        r1.addSpacing(16); r1.addWidget(QLabel("剩余时间:"))
         self.remaining_time_label = QLabel("--:--")
-        self.remaining_time_label.setStyleSheet("font-weight: bold; color: blue;")
-        layout.addWidget(self.remaining_time_label)
-        
-        layout.addStretch()
-        
-        self.help_btn = QPushButton("点击查看使用手册")
-        self.help_btn.setMinimumWidth(80)
-        layout.addWidget(self.help_btn)
-        
-        return group
-    
+        r1.addWidget(self.remaining_time_label)
+        r1.addSpacing(12); r1.addWidget(QLabel("运行中:"))
+        self.running_count_label = QLabel("0")
+        r1.addWidget(self.running_count_label)
+        r1.addStretch()
+        self.help_btn = QPushButton("使用手册")
+        r1.addWidget(self.help_btn)
+        v.addLayout(r1)
+
+        r2 = QHBoxLayout()
+        r2.addWidget(QLabel("开始热键:"))
+        self.start_hotkey_edit = QKeySequenceEdit(self._start_hotkey_seq)
+        r2.addWidget(self.start_hotkey_edit)
+        r2.addSpacing(12)
+        r2.addWidget(QLabel("停止热键:"))
+        self.stop_hotkey_edit = QKeySequenceEdit(self._stop_hotkey_seq)
+        r2.addWidget(self.stop_hotkey_edit)
+        self.apply_hotkey_btn = QPushButton("应用热键")
+        r2.addWidget(self.apply_hotkey_btn)
+        r2.addStretch()
+        v.addLayout(r2)
+        return g
+
     def _create_config_group(self) -> QGroupBox:
-        """
-        创建任务配置区域。
-        Returns:
-            QGroupBox: 任务配置分组框
-        """
-        group = QGroupBox("任务配置")
-        layout = QVBoxLayout(group)
-        
-        row1_layout = QHBoxLayout()
-        
-        row1_layout.addWidget(QLabel("任务类型:"))
-        
+        g = QGroupBox("任务配置（当前选中窗口）")
+        v = QVBoxLayout(g)
+
+        task_type_row = QHBoxLayout()
+        task_type_row.addWidget(QLabel("任务类型:"))
         self.task_type_group = QButtonGroup(self)
-        
-        self.radio_small_account = QRadioButton("小号做动作(动作+跳)")
-        self.radio_host_action = QRadioButton("房主同乘做动作")
-        
+        self.radio_small_account = QRadioButton(TASK_TYPE_SMALL)
+        self.radio_host_action = QRadioButton(TASK_TYPE_HOST)
+        self.radio_time_adjust = QRadioButton(TASK_TYPE_TIME_ADJUST)
         self.task_type_group.addButton(self.radio_small_account, 0)
         self.task_type_group.addButton(self.radio_host_action, 1)
-        
-        self.radio_small_account.setChecked(True)
-        
-        row1_layout.addWidget(self.radio_small_account)
-        row1_layout.addWidget(self.radio_host_action)
-        
-        row1_layout.addSpacing(30)
-        
-        row1_layout.addWidget(QLabel("动作按键:"))
-        self.action_key_combo = QComboBox()
-        self.action_key_combo.addItems([str(i) for i in range(1, 6)])
-        self.action_key_combo.setCurrentIndex(1)
-        self.action_key_combo.setMinimumWidth(60)
-        row1_layout.addWidget(self.action_key_combo)
-        
-        row1_layout.addSpacing(20)
-        
-        row1_layout.addWidget(QLabel("动作间隔(秒):"))
-        row1_layout.addWidget(QLabel("最小"))
-        self.interval_min_spin = QSpinBox()
-        self.interval_min_spin.setRange(8, 30)
-        self.interval_min_spin.setValue(8)
-        self.interval_min_spin.setMinimumWidth(60)
-        row1_layout.addWidget(self.interval_min_spin)
-        
-        row1_layout.addWidget(QLabel("最大"))
-        self.interval_max_spin = QSpinBox()
-        self.interval_max_spin.setRange(9, 30)
-        self.interval_max_spin.setValue(20)
-        self.interval_max_spin.setMinimumWidth(60)
-        row1_layout.addWidget(self.interval_max_spin)
-        
-        row1_layout.addStretch()
-        
-        layout.addLayout(row1_layout)
-        
-        row2_layout = QHBoxLayout()
-        
-        row2_layout.addWidget(QLabel("运行时长(分钟):"))
-        self.duration_spin = QSpinBox()
-        self.duration_spin.setRange(1, 60000)
-        self.duration_spin.setValue(60)
-        self.duration_spin.setMinimumWidth(60)
-        row2_layout.addWidget(self.duration_spin)
-        
-        row2_layout.addSpacing(30)
-        
+        self.task_type_group.addButton(self.radio_time_adjust, 2)
+        task_type_row.addWidget(self.radio_small_account)
+        task_type_row.addWidget(self.radio_host_action)
+        task_type_row.addWidget(self.radio_time_adjust)
+        task_type_row.addStretch()
+        v.addLayout(task_type_row)
+
+        self.global_config_group = QGroupBox("全局配置")
+        global_layout = QHBoxLayout(self.global_config_group)
+        global_layout.addWidget(QLabel("运行时长(分钟):"))
+        self.duration_spin = QSpinBox(); self.duration_spin.setRange(1, 60000)
+        global_layout.addWidget(self.duration_spin)
         self.auto_shutdown_checkbox = QCheckBox("任务完成后自动关机")
-        self.auto_shutdown_checkbox.setChecked(False)
-        
-        row2_layout.addWidget(self.auto_shutdown_checkbox)
-        
-        row2_layout.addStretch()
-        
-        layout.addLayout(row2_layout)
-        
-        row3_layout = QHBoxLayout()
-        
+        global_layout.addSpacing(20)
+        global_layout.addWidget(self.auto_shutdown_checkbox)
+        global_layout.addSpacing(20)
+        self.monthly_card_close_checkbox = QCheckBox("启用月卡关闭")
+        self.monthly_card_minute_spin = QSpinBox(); self.monthly_card_minute_spin.setRange(1, 5); self.monthly_card_minute_spin.setPrefix("0")
+        global_layout.addWidget(self.monthly_card_close_checkbox)
+        global_layout.addWidget(QLabel("执行时间: 04:"))
+        global_layout.addWidget(self.monthly_card_minute_spin)
+        global_layout.addWidget(QLabel("(仅支持 04:01-04:05)"))
+        global_layout.addStretch()
+        v.addWidget(self.global_config_group)
+
+        self.action_task_group = QGroupBox("动作任务配置")
+        action_layout = QVBoxLayout(self.action_task_group)
+
+        action_row_1 = QHBoxLayout()
+        action_row_1.addWidget(QLabel("动作按键:"))
+        self.action_key_combo = QComboBox(); self.action_key_combo.addItems([str(i) for i in range(1, 6)])
+        action_row_1.addWidget(self.action_key_combo)
+        action_row_1.addSpacing(20)
+        action_row_1.addWidget(QLabel("动作间隔(秒):"))
+        self.interval_min_spin = QSpinBox(); self.interval_min_spin.setRange(1, 600)
+        self.interval_max_spin = QSpinBox(); self.interval_max_spin.setRange(1, 600)
+        action_row_1.addWidget(self.interval_min_spin)
+        action_row_1.addWidget(QLabel("-"))
+        action_row_1.addWidget(self.interval_max_spin)
+        self.anti_jelly_checkbox = QCheckBox("防变果冻")
+        action_row_1.addSpacing(20)
+        action_row_1.addWidget(self.anti_jelly_checkbox)
+        self.action_jump_checkbox = QCheckBox("开启动作跳")
+        action_row_1.addSpacing(20)
+        action_row_1.addWidget(self.action_jump_checkbox)
+        action_row_1.addStretch()
+        action_layout.addLayout(action_row_1)
+
+        action_row_2 = QHBoxLayout()
         self.random_cruise_checkbox = QCheckBox("随机巡航")
-        self.random_cruise_checkbox.setChecked(False)
-        self.random_cruise_checkbox.stateChanged.connect(self._on_random_cruise_changed)
-        row3_layout.addWidget(self.random_cruise_checkbox)
-        
-        row3_layout.addSpacing(20)
-        
-        row3_layout.addWidget(QLabel("巡航触发概率:"))
-        self.cruise_probability_spin = QSpinBox()
-        self.cruise_probability_spin.setRange(1, 100)
+        self.cruise_probability_spin = QSpinBox(); self.cruise_probability_spin.setRange(1, 100); self.cruise_probability_spin.setSuffix("%")
+        self.cruise_hold_min_spin = QDoubleSpinBox(); self.cruise_hold_min_spin.setRange(0, 5); self.cruise_hold_min_spin.setSingleStep(0.1)
+        self.cruise_hold_max_spin = QDoubleSpinBox(); self.cruise_hold_max_spin.setRange(0, 5); self.cruise_hold_max_spin.setSingleStep(0.1)
+        self.cruise_space_min_spin = QSpinBox(); self.cruise_space_min_spin.setRange(0, 20)
+        self.cruise_space_max_spin = QSpinBox(); self.cruise_space_max_spin.setRange(0, 20)
+        action_row_2.addWidget(self.random_cruise_checkbox)
+        action_row_2.addWidget(QLabel("概率:")); action_row_2.addWidget(self.cruise_probability_spin)
+        action_row_2.addWidget(QLabel("移动:")); action_row_2.addWidget(self.cruise_hold_min_spin); action_row_2.addWidget(QLabel("-")); action_row_2.addWidget(self.cruise_hold_max_spin)
+        action_row_2.addWidget(QLabel("空格:")); action_row_2.addWidget(self.cruise_space_min_spin); action_row_2.addWidget(QLabel("-")); action_row_2.addWidget(self.cruise_space_max_spin)
+        action_row_2.addStretch()
+        action_layout.addLayout(action_row_2)
+        v.addWidget(self.action_task_group)
+
+        self.time_adjust_group = QGroupBox("游戏时间调整配置")
+        time_adjust_layout = QVBoxLayout(self.time_adjust_group)
+
+        time_adjust_row = QHBoxLayout()
+        time_adjust_row.addWidget(QLabel("调整间隔:"))
+        time_adjust_row.addWidget(QLabel("最小"))
+        self.time_adjust_interval_min_minute_spin = QSpinBox(); self.time_adjust_interval_min_minute_spin.setRange(0, 25)
+        self.time_adjust_interval_min_second_spin = QSpinBox(); self.time_adjust_interval_min_second_spin.setRange(0, 59)
+        time_adjust_row.addWidget(self.time_adjust_interval_min_minute_spin)
+        time_adjust_row.addWidget(QLabel("分"))
+        time_adjust_row.addWidget(self.time_adjust_interval_min_second_spin)
+        time_adjust_row.addWidget(QLabel("秒"))
+        time_adjust_row.addWidget(QLabel("-"))
+        time_adjust_row.addWidget(QLabel("最大"))
+        self.time_adjust_interval_max_minute_spin = QSpinBox(); self.time_adjust_interval_max_minute_spin.setRange(0, 25)
+        self.time_adjust_interval_max_second_spin = QSpinBox(); self.time_adjust_interval_max_second_spin.setRange(0, 59)
+        time_adjust_row.addWidget(self.time_adjust_interval_max_minute_spin)
+        time_adjust_row.addWidget(QLabel("分"))
+        time_adjust_row.addWidget(self.time_adjust_interval_max_second_spin)
+        time_adjust_row.addWidget(QLabel("秒"))
+        time_adjust_row.addStretch()
+        time_adjust_layout.addLayout(time_adjust_row)
+
+        time_adjust_options_row = QHBoxLayout()
+        self.time_adjust_release_pet_checkbox = QCheckBox("非识别释放精灵")
+        time_adjust_options_row.addWidget(self.time_adjust_release_pet_checkbox)
+        self.time_adjust_use_release_pet_recognition_checkbox = QCheckBox("识别释放精灵")
+        self.time_adjust_use_release_pet_recognition_checkbox.setToolTip("勾选后使用识别释放逻辑")
+        time_adjust_options_row.addWidget(self.time_adjust_use_release_pet_recognition_checkbox)
+        self.time_adjust_anti_jelly_checkbox = QCheckBox("防果冻")
+        time_adjust_options_row.addWidget(self.time_adjust_anti_jelly_checkbox)
+        self.time_adjust_topmost_recognition_checkbox = QCheckBox("置顶识别调整")
+        time_adjust_options_row.addWidget(self.time_adjust_topmost_recognition_checkbox)
+        self.time_adjust_exit_interface_checkbox = QCheckBox("退出改时间界面")
+        time_adjust_options_row.addWidget(self.time_adjust_exit_interface_checkbox)
+        time_adjust_options_row.addStretch()
+        time_adjust_layout.addLayout(time_adjust_options_row)
+
+        self.time_adjust_mouse_warning_label = QLabel("提示：勾选“释放精灵”或“置顶识别调整”任意一项都会抢鼠标。取消勾选“退出改时间界面”后无法使用释放精灵。")
+        self.time_adjust_mouse_warning_label.setWordWrap(True)
+        self.time_adjust_mouse_warning_label.setStyleSheet("color: #d9534f;")
+        time_adjust_layout.addSpacing(6)
+        time_adjust_layout.addWidget(self.time_adjust_mouse_warning_label)
+        v.addWidget(self.time_adjust_group)
+
+        self.radio_small_account.setChecked(True)
+        self.action_key_combo.setCurrentText("2")
+        self.interval_min_spin.setValue(8); self.interval_max_spin.setValue(9); self.duration_spin.setValue(60000)
         self.cruise_probability_spin.setValue(22)
-        self.cruise_probability_spin.setSuffix("%")
-        self.cruise_probability_spin.setMinimumWidth(70)
-        row3_layout.addWidget(self.cruise_probability_spin)
-        
-        row3_layout.addSpacing(20)
-        
-        row3_layout.addWidget(QLabel("移动时长:"))
-        self.cruise_hold_min_spin = QDoubleSpinBox()
-        self.cruise_hold_min_spin.setRange(0, 0.5)
-        self.cruise_hold_min_spin.setValue(0.2)
-        self.cruise_hold_min_spin.setSingleStep(0.1)
-        self.cruise_hold_min_spin.setMinimumWidth(60)
-        row3_layout.addWidget(self.cruise_hold_min_spin)
-        
-        row3_layout.addWidget(QLabel("-"))
-        
-        self.cruise_hold_max_spin = QDoubleSpinBox()
-        self.cruise_hold_max_spin.setRange(0, 0.5)
-        self.cruise_hold_max_spin.setValue(0.4)
-        self.cruise_hold_max_spin.setSingleStep(0.1)
-        self.cruise_hold_max_spin.setMinimumWidth(60)
-        row3_layout.addWidget(self.cruise_hold_max_spin)
-        
-        row3_layout.addWidget(QLabel("秒"))
-        
-        row3_layout.addSpacing(20)
-        
-        row3_layout.addWidget(QLabel("空格次数:"))
-        self.cruise_space_min_spin = QSpinBox()
-        self.cruise_space_min_spin.setRange(0,2)
-        self.cruise_space_min_spin.setValue(0)
-        self.cruise_space_min_spin.setMinimumWidth(50)
-        row3_layout.addWidget(self.cruise_space_min_spin)
-        
-        row3_layout.addWidget(QLabel("-"))
-        
-        self.cruise_space_max_spin = QSpinBox()
-        self.cruise_space_max_spin.setRange(0,2)
-        self.cruise_space_max_spin.setValue(1)
-        self.cruise_space_max_spin.setMinimumWidth(50)
-        row3_layout.addWidget(self.cruise_space_max_spin)
-        
-        row3_layout.addWidget(QLabel("次"))
-        
-        row3_layout.addStretch()
-        
-        layout.addLayout(row3_layout)
-        
-        return group
-    
-    def _on_random_cruise_changed(self, state):
-        """
-        随机巡航复选框状态改变处理。
-        Args:
-            state: 复选框状态
-        """
-        enabled = state == Qt.Checked
-        self.cruise_probability_spin.setEnabled(enabled)
-        self.cruise_hold_min_spin.setEnabled(enabled)
-        self.cruise_hold_max_spin.setEnabled(enabled)
-        self.cruise_space_min_spin.setEnabled(enabled)
-        self.cruise_space_max_spin.setEnabled(enabled)
-    
+        self.cruise_hold_min_spin.setValue(0.2); self.cruise_hold_max_spin.setValue(0.4)
+        self.cruise_space_min_spin.setValue(0); self.cruise_space_max_spin.setValue(1)
+        self.anti_jelly_checkbox.setChecked(True)
+        self.action_jump_checkbox.setChecked(True)
+        self.time_adjust_interval_min_minute_spin.setValue(15)
+        self.time_adjust_interval_min_second_spin.setValue(0)
+        self.time_adjust_interval_max_minute_spin.setValue(21)
+        self.time_adjust_interval_max_second_spin.setValue(0)
+        self.time_adjust_release_pet_checkbox.setChecked(False)
+        self.time_adjust_use_release_pet_recognition_checkbox.setChecked(False)
+        self.time_adjust_anti_jelly_checkbox.setChecked(False)
+        self.time_adjust_topmost_recognition_checkbox.setChecked(False)
+        self.time_adjust_exit_interface_checkbox.setChecked(True)
+        self.monthly_card_minute_spin.setValue(1)
+        self.monthly_card_minute_spin.setEnabled(False)
+        self._update_task_type_ui()
+        return g
+
     def _create_window_control_group(self) -> QGroupBox:
-        """
-        创建窗口控制区域。
-        Returns:
-            QGroupBox: 窗口控制分组框
-        """
-        group = QGroupBox("窗口控制")
-        layout = QHBoxLayout(group)
-        
-        layout.addWidget(QLabel("宽度:"))
-        self.window_width_spin = QSpinBox()
-        self.window_width_spin.setRange(400, 3840)
-        self.window_width_spin.setValue(1280)
-        self.window_width_spin.setMinimumWidth(80)
-        layout.addWidget(self.window_width_spin)
-        
-        layout.addSpacing(10)
-        
-        layout.addWidget(QLabel("高度:"))
-        self.window_height_spin = QSpinBox()
-        self.window_height_spin.setRange(300, 2160)
-        self.window_height_spin.setValue(720)
-        self.window_height_spin.setMinimumWidth(80)
-        layout.addWidget(self.window_height_spin)
-        
-        layout.addSpacing(20)
-        
-        layout.addWidget(QLabel("X:"))
-        self.window_x_spin = QSpinBox()
-        self.window_x_spin.setRange(0, 3840)
-        self.window_x_spin.setValue(0)
-        self.window_x_spin.setMinimumWidth(80)
-        layout.addWidget(self.window_x_spin)
-        
-        layout.addSpacing(10)
-        
-        layout.addWidget(QLabel("Y:"))
-        self.window_y_spin = QSpinBox()
-        self.window_y_spin.setRange(0, 2160)
-        self.window_y_spin.setValue(0)
-        self.window_y_spin.setMinimumWidth(80)
-        layout.addWidget(self.window_y_spin)
-        
-        layout.addSpacing(20)
-        
-        self.apply_window_btn = QPushButton("应用")
-        self.apply_window_btn.setMinimumWidth(60)
-        self.apply_window_btn.setEnabled(False)
-        layout.addWidget(self.apply_window_btn)
-        
-        layout.addSpacing(20)
-        
-        self.force_topmost_checkbox = QCheckBox("强制置顶")
-        self.force_topmost_checkbox.setEnabled(False)
-        layout.addWidget(self.force_topmost_checkbox)
-        
-        layout.addStretch()
-        
-        return group
-    
+        g = QGroupBox("窗口控制（当前选中窗口）")
+        h = QHBoxLayout(g)
+        h.addWidget(QLabel("宽:")); self.window_width_spin = QSpinBox(); self.window_width_spin.setRange(400, 3840); h.addWidget(self.window_width_spin)
+        h.addWidget(QLabel("高:")); self.window_height_spin = QSpinBox(); self.window_height_spin.setRange(300, 2160); h.addWidget(self.window_height_spin)
+        h.addWidget(QLabel("X:")); self.window_x_spin = QSpinBox(); self.window_x_spin.setRange(0, 3840); h.addWidget(self.window_x_spin)
+        h.addWidget(QLabel("Y:")); self.window_y_spin = QSpinBox(); self.window_y_spin.setRange(0, 2160); h.addWidget(self.window_y_spin)
+        self.apply_window_btn = QPushButton("应用"); h.addWidget(self.apply_window_btn)
+        self.force_topmost_checkbox = QCheckBox("强制置顶"); h.addWidget(self.force_topmost_checkbox)
+        self.window_width_spin.setValue(1000)
+        self.window_height_spin.setValue(600)
+        h.addStretch()
+        return g
+
     def _create_log_group(self) -> QGroupBox:
-        """
-        创建日志显示区域。
-        Returns:
-            QGroupBox: 日志显示分组框
-        """
-        group = QGroupBox("日志信息")
-        layout = QVBoxLayout(group)
-        
-        self.log_text = QTextEdit()
-        self.log_text.setReadOnly(True)
-        self.log_text.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4; font-family: Consolas;")
-        layout.addWidget(self.log_text)
-        
-        return group
-    
+        g = QGroupBox("日志")
+        v = QVBoxLayout(g)
+        self.log_text = QTextEdit(); self.log_text.setReadOnly(True)
+        self.log_text.setStyleSheet("background:#1e1e1e;color:#d4d4d4;font-family:Consolas;")
+        v.addWidget(self.log_text)
+        return g
+
+    def _create_group_info_group(self) -> QGroupBox:
+        g = QGroupBox("交流群")
+        g.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        g.setMaximumHeight(72)
+        h = QHBoxLayout(g)
+        h.addWidget(QLabel("秋秋群聊：625148675"))
+        h.addStretch()
+        self.qq_group_btn = QPushButton("加入群聊")
+        h.addWidget(self.qq_group_btn)
+        return g
+
     def _connect_signals(self):
-        """连接信号槽。"""
         self.window_picker.window_picked.connect(self._on_window_picked)
         self.window_picker.pick_failed.connect(self._on_pick_failed)
-        self.window_picker.pick_status.connect(self._on_pick_status)
-        
+        self.window_picker.pick_status.connect(lambda m: self.append_log(m))
+        self.bound_windows_list.currentItemChanged.connect(self._on_selected_window_changed)
+        self.unbind_btn.clicked.connect(self._on_unbind_clicked)
         self.start_btn.clicked.connect(self._on_start_clicked)
         self.stop_btn.clicked.connect(self._on_stop_clicked)
         self.apply_window_btn.clicked.connect(self._on_apply_window)
-        self.unbind_btn.clicked.connect(self._on_unbind_clicked)
-        self.help_btn.clicked.connect(self._on_help_clicked)
         self.force_topmost_checkbox.stateChanged.connect(self._on_topmost_changed)
-    
-    def _on_window_picked(self, hwnd: int):
-        """
-        窗口选择成功处理。
-        Args:
-            hwnd: 窗口句柄
-        """
-        self._bound_hwnd = hwnd
-        
-        try:
-            window_title = win32gui.GetWindowText(hwnd)
-            class_name = win32gui.GetClassName(hwnd)
-            rect = win32gui.GetWindowRect(hwnd)
-            width = rect[2] - rect[0]
-            height = rect[3] - rect[1]
-        except Exception:
-            window_title = "未知"
-            class_name = "未知"
-            width = 0
-            height = 0
-        
-        self.window_status_label.setText(f"已绑定: {hwnd}")
-        self.window_status_label.setStyleSheet("color: green;")
-        self.window_picker.get_button().setEnabled(False)
-        self.unbind_btn.setEnabled(True)
-        self.start_btn.setEnabled(True)
-        self.apply_window_btn.setEnabled(True)
-        self.force_topmost_checkbox.setEnabled(True)
-        
-        try:
-            win32gui.SetWindowPos(
-                self._bound_hwnd,
-                win32con.HWND_NOTOPMOST,
-                0, 0, 0, 0,
-                win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_SHOWWINDOW
-            )
-        except Exception:
-            pass
-        
-        self.append_log(f"成功绑定窗口")
-        self.append_log(f"  句柄: {hwnd}")
-        self.append_log(f"  标题: {window_title}")
-        self.append_log(f"  类名: {class_name}")
-        self.append_log(f"  尺寸: {width}x{height}")
-    
+        self.help_btn.clicked.connect(lambda: webbrowser.open("https://wcn33wxdu7tm.feishu.cn/wiki/YGWiwIhsyio98NkiV95cpIcsnAc"))
+        self.qq_group_btn.clicked.connect(lambda: webbrowser.open("http://qm.qq.com/cgi-bin/qm/qr?_wv=1027&k=mlO8aqGphhWo2__HuVGrmxmxNmCwvzd-&authKey=atGfagiipTnEzXwbQYQbsz%2BmL9SZJLgRI47hGzmWOs%2BTcZ5Xv%2FKaT5bg4ZjvvUL7&noverify=0&group_code=625148675"))
+        self.random_cruise_checkbox.stateChanged.connect(self._on_random_cruise_changed)
+        self.time_adjust_release_pet_checkbox.stateChanged.connect(self._on_time_adjust_release_pet_changed)
+        self.time_adjust_use_release_pet_recognition_checkbox.stateChanged.connect(self._on_time_adjust_release_pet_recognition_changed)
+        self.time_adjust_exit_interface_checkbox.stateChanged.connect(self._on_time_adjust_exit_interface_changed)
+        self.monthly_card_close_checkbox.stateChanged.connect(lambda s: self.monthly_card_minute_spin.setEnabled(s == Qt.Checked))
+        self.radio_small_account.toggled.connect(self._on_task_type_changed)
+        self.radio_host_action.toggled.connect(self._on_task_type_changed)
+        self.radio_time_adjust.toggled.connect(self._on_task_type_changed)
+        self.apply_hotkey_btn.clicked.connect(self._on_apply_hotkeys)
+        self._connect_profile_signals()
+
+    def _connect_profile_signals(self):
+        ctrls = [
+            self.radio_small_account, self.radio_host_action, self.radio_time_adjust, self.action_key_combo,
+            self.interval_min_spin, self.interval_max_spin, self.duration_spin,
+            self.time_adjust_interval_min_minute_spin, self.time_adjust_interval_min_second_spin,
+            self.time_adjust_interval_max_minute_spin, self.time_adjust_interval_max_second_spin,
+            self.auto_shutdown_checkbox, self.window_width_spin, self.window_height_spin,
+            self.window_x_spin, self.window_y_spin, self.force_topmost_checkbox,
+            self.anti_jelly_checkbox,
+            self.random_cruise_checkbox, self.cruise_probability_spin, self.cruise_hold_min_spin,
+            self.cruise_hold_max_spin, self.cruise_space_min_spin, self.cruise_space_max_spin,
+            self.action_jump_checkbox, self.time_adjust_release_pet_checkbox,
+            self.time_adjust_use_release_pet_recognition_checkbox, self.time_adjust_anti_jelly_checkbox,
+            self.time_adjust_topmost_recognition_checkbox, self.time_adjust_exit_interface_checkbox, self.monthly_card_close_checkbox,
+            self.monthly_card_minute_spin,
+        ]
+        for c in ctrls:
+            if isinstance(c, (QSpinBox, QDoubleSpinBox)):
+                c.valueChanged.connect(self._on_profile_changed)
+            elif isinstance(c, QComboBox):
+                c.currentTextChanged.connect(self._on_profile_changed)
+            elif isinstance(c, QCheckBox):
+                c.stateChanged.connect(self._on_profile_changed)
+            else:
+                c.toggled.connect(self._on_profile_changed)
+
+    def _on_profile_changed(self, *_):
+        if self._loading_profile:
+            return
+        self._save_ui_to_profile()
+
+    def _on_random_cruise_changed(self, state):
+        e = state == Qt.Checked
+        self.cruise_probability_spin.setEnabled(e)
+        self.cruise_hold_min_spin.setEnabled(e)
+        self.cruise_hold_max_spin.setEnabled(e)
+        self.cruise_space_min_spin.setEnabled(e)
+        self.cruise_space_max_spin.setEnabled(e)
+        self._on_profile_changed()
+
+    def _on_time_adjust_release_pet_changed(self, state):
+        if state == Qt.Checked and not self.time_adjust_exit_interface_checkbox.isChecked():
+            self.time_adjust_exit_interface_checkbox.setChecked(True)
+        if state == Qt.Checked and self.time_adjust_use_release_pet_recognition_checkbox.isChecked():
+            self.time_adjust_use_release_pet_recognition_checkbox.setChecked(False)
+        self.time_adjust_use_release_pet_recognition_checkbox.setEnabled(
+            self._is_time_adjust_selected() and not self._is_time_adjust_keep_open_selected()
+        )
+        self._on_profile_changed()
+
+    def _on_time_adjust_release_pet_recognition_changed(self, state):
+        if state == Qt.Checked:
+            if self.time_adjust_release_pet_checkbox.isChecked():
+                self.time_adjust_release_pet_checkbox.setChecked(False)
+            if not self.time_adjust_topmost_recognition_checkbox.isChecked():
+                self.time_adjust_topmost_recognition_checkbox.setChecked(True)
+            if not self.time_adjust_exit_interface_checkbox.isChecked():
+                self.time_adjust_exit_interface_checkbox.setChecked(True)
+        self._on_profile_changed()
+
+    def _on_time_adjust_exit_interface_changed(self, state):
+        keep_open = state != Qt.Checked
+        if keep_open and self.time_adjust_release_pet_checkbox.isChecked():
+            self.time_adjust_release_pet_checkbox.setChecked(False)
+        if keep_open and self.time_adjust_use_release_pet_recognition_checkbox.isChecked():
+            self.time_adjust_use_release_pet_recognition_checkbox.setChecked(False)
+        if keep_open and self.time_adjust_anti_jelly_checkbox.isChecked():
+            self.time_adjust_anti_jelly_checkbox.setChecked(False)
+        self.time_adjust_release_pet_checkbox.setEnabled(self._is_time_adjust_selected() and not keep_open)
+        self.time_adjust_use_release_pet_recognition_checkbox.setEnabled(
+            self._is_time_adjust_selected() and not keep_open
+        )
+        self.time_adjust_anti_jelly_checkbox.setEnabled(self._is_time_adjust_selected() and not keep_open)
+        self._on_profile_changed()
+
+    def _set_time_adjust_interval_ui(self, min_minutes: float, max_minutes: float):
+        min_m, min_s = _minutes_to_minute_second_parts(min_minutes)
+        max_m, max_s = _minutes_to_minute_second_parts(max_minutes)
+        self.time_adjust_interval_min_minute_spin.setValue(min_m)
+        self.time_adjust_interval_min_second_spin.setValue(min_s)
+        self.time_adjust_interval_max_minute_spin.setValue(max_m)
+        self.time_adjust_interval_max_second_spin.setValue(max_s)
+
+    def _get_time_adjust_interval_values(self) -> Tuple[float, float]:
+        min_minutes = _minute_second_parts_to_minutes(
+            self.time_adjust_interval_min_minute_spin.value(),
+            self.time_adjust_interval_min_second_spin.value(),
+        )
+        max_minutes = _minute_second_parts_to_minutes(
+            self.time_adjust_interval_max_minute_spin.value(),
+            self.time_adjust_interval_max_second_spin.value(),
+        )
+        min_minutes = max(0.1, min(25.0, min_minutes))
+        max_minutes = max(0.1, min(25.0, max_minutes))
+        if min_minutes > max_minutes:
+            min_minutes, max_minutes = max_minutes, min_minutes
+        return min_minutes, max_minutes
+
+    def _is_time_adjust_selected(self) -> bool:
+        return self.radio_time_adjust.isChecked()
+
+    def _is_time_adjust_keep_open_selected(self) -> bool:
+        return not self.time_adjust_exit_interface_checkbox.isChecked()
+
+    def _update_task_type_ui(self):
+        is_time_adjust = self._is_time_adjust_selected()
+        self.action_task_group.setEnabled(not is_time_adjust)
+        self.time_adjust_group.setEnabled(is_time_adjust)
+        self.random_cruise_checkbox.setEnabled(not is_time_adjust)
+        cruise_enabled = not is_time_adjust and self.random_cruise_checkbox.isChecked()
+        self.cruise_probability_spin.setEnabled(cruise_enabled)
+        self.cruise_hold_min_spin.setEnabled(cruise_enabled)
+        self.cruise_hold_max_spin.setEnabled(cruise_enabled)
+        self.cruise_space_min_spin.setEnabled(cruise_enabled)
+        self.cruise_space_max_spin.setEnabled(cruise_enabled)
+        self.time_adjust_release_pet_checkbox.setEnabled(is_time_adjust and not self._is_time_adjust_keep_open_selected())
+        self.time_adjust_use_release_pet_recognition_checkbox.setEnabled(
+            is_time_adjust and not self._is_time_adjust_keep_open_selected()
+        )
+        self.time_adjust_anti_jelly_checkbox.setEnabled(is_time_adjust and not self._is_time_adjust_keep_open_selected())
+        self.time_adjust_topmost_recognition_checkbox.setEnabled(is_time_adjust)
+        self.time_adjust_exit_interface_checkbox.setEnabled(is_time_adjust)
+
+    def _on_task_type_changed(self, *_):
+        self._update_task_type_ui()
+        self._on_profile_changed()
+
     def _on_pick_failed(self):
-        """窗口选择失败处理。"""
-        self._bound_hwnd = 0
-        
-        self.window_status_label.setText("窗口选择失败，请重试")
-        self.window_status_label.setStyleSheet("color: red;")
         self.window_picker.get_button().setEnabled(True)
-        self.unbind_btn.setEnabled(False)
-        self.start_btn.setEnabled(False)
-        self.apply_window_btn.setEnabled(False)
-        self.force_topmost_checkbox.setEnabled(False)
-        
-        self.append_log("窗口选择失败，请重新绑定窗口")
-    
-    def _on_pick_status(self, message: str):
-        """
-        窗口选择状态更新处理。
-        Args:
-            message: 状态消息
-        """
-        self.append_log(message)
-    
+        self.window_status_label.setText("世界选择失败，请重试")
+        self.window_status_label.setStyleSheet("color: #d9534f;")
+        self.append_log("窗口选择失败", "red")
+    def _on_window_picked(self, hwnd: int):
+        self.window_picker.get_button().setEnabled(True)
+        try:
+            title = win32gui.GetWindowText(hwnd) or "未命名窗口"
+            cls = win32gui.GetClassName(hwnd)
+        except Exception:
+            title, cls = "未命名窗口", ""
+        if hwnd not in self._profiles:
+            p = copy.deepcopy(self._legacy_default)
+            p.window_title = title; p.window_class = cls
+            self._profiles[hwnd] = p
+            item = QListWidgetItem(self._item_text(hwnd)); item.setData(Qt.UserRole, hwnd)
+            self.bound_windows_list.addItem(item)
+            self.append_log(f"新增绑定: {self._window_tag(hwnd)}", "green")
+        else:
+            self._profiles[hwnd].window_title = title
+            self._profiles[hwnd].window_class = cls
+            self._refresh_item(hwnd)
+        self._select_hwnd(hwnd)
+        self.window_status_label.setStyleSheet("color: #5cb85c;")
+        self.window_status_label.setText(f"已绑定: {self._window_tag(hwnd)}")
+        self.save_config()
+        self._refresh_control_state()
+
+    def _item_text(self, hwnd: int) -> str:
+        running = self._sessions.get(hwnd).running if hwnd in self._sessions else False
+        return f"{'●' if running else '○'} {self._window_alias(hwnd)}"
+
+    def _window_alias(self, hwnd: int) -> str:
+        for i in range(self.bound_windows_list.count()):
+            it = self.bound_windows_list.item(i)
+            if int(it.data(Qt.UserRole)) == hwnd:
+                return f"第{i + 1}个世界"
+        return f"第{self.bound_windows_list.count() + 1}个世界"
+
+    def _window_tag(self, hwnd: int) -> str:
+        return f"{self._window_alias(hwnd)}({hwnd})"
+
+    def _refresh_item(self, hwnd: int):
+        for i in range(self.bound_windows_list.count()):
+            it = self.bound_windows_list.item(i)
+            if int(it.data(Qt.UserRole)) == hwnd:
+                it.setText(self._item_text(hwnd))
+                return
+
+    def _select_hwnd(self, hwnd: int):
+        for i in range(self.bound_windows_list.count()):
+            it = self.bound_windows_list.item(i)
+            if int(it.data(Qt.UserRole)) == hwnd:
+                self.bound_windows_list.setCurrentItem(it)
+                return
+
+    def _on_selected_window_changed(self, cur, _prev):
+        if cur is None:
+            self._selected_hwnd = None
+            self.window_status_label.setText("未选择世界")
+            self._refresh_control_state()
+            return
+        self._selected_hwnd = int(cur.data(Qt.UserRole))
+        self.window_status_label.setText(f"当前选择: {self._window_tag(self._selected_hwnd)}")
+        self._load_profile_to_ui()
+        self._refresh_control_state()
+
     def _on_unbind_clicked(self):
-        """解绑按钮点击处理。"""
-        if self._is_running:
-            self._stop_task()
-            self.append_log("任务已停止")
-        
-        self._bound_hwnd = 0
-        
-        self.window_status_label.setText("未绑定窗口")
-        self.window_status_label.setStyleSheet("color: gray;")
-        self.window_picker.get_button().setEnabled(True)
-        self.unbind_btn.setEnabled(False)
-        self.start_btn.setEnabled(False)
-        self.apply_window_btn.setEnabled(False)
-        self.force_topmost_checkbox.setEnabled(False)
-        
-        self.append_log("已解绑窗口")
-    
-    def _on_help_clicked(self):
-        """使用说明按钮点击处理。"""
-        import webbrowser
-        url = "https://wcn33wxdu7tm.feishu.cn/wiki/YGWiwIhsyio98NkiV95cpIcsnAc"
-        try:
-            webbrowser.open(url)
-        except Exception as e:
-            self.append_log(f"打开链接失败: {str(e)}")
-    
+        hwnd = self._selected_hwnd
+        if hwnd is None:
+            return
+        self._stop_session(hwnd, manual=True)
+        self._profiles.pop(hwnd, None)
+        self._sessions.pop(hwnd, None)
+        for i in range(self.bound_windows_list.count()):
+            it = self.bound_windows_list.item(i)
+            if int(it.data(Qt.UserRole)) == hwnd:
+                self.bound_windows_list.takeItem(i)
+                break
+        self.append_log(f"已解绑: {self._window_tag(hwnd)}")
+        for other_hwnd in self._profiles:
+            self._refresh_item(other_hwnd)
+        self.save_config()
+        self._refresh_control_state()
+
     def _on_start_clicked(self):
-        """开始按钮点击处理。"""
-        if self._is_running:
-            return
-        
-        if self._bound_hwnd == 0:
-            self.append_log("错误: 未绑定窗口")
-            return
-        
-        if self.interval_min_spin.value() > self.interval_max_spin.value():
-            self.append_log(f"警告: 动作间隔最小值({self.interval_min_spin.value()})大于最大值({self.interval_max_spin.value()})，已自动交换", color="red")
-            min_val = self.interval_min_spin.value()
-            max_val = self.interval_max_spin.value()
-            self.interval_min_spin.setValue(max_val)
-            self.interval_max_spin.setValue(min_val)
-        
-        if self.random_cruise_checkbox.isChecked():
-            if self.cruise_hold_min_spin.value() > self.cruise_hold_max_spin.value():
-                self.append_log(f"警告: 长按时长最小值({self.cruise_hold_min_spin.value()})大于最大值({self.cruise_hold_max_spin.value()})，已自动交换", color="red")
-                min_val = self.cruise_hold_min_spin.value()
-                max_val = self.cruise_hold_max_spin.value()
-                self.cruise_hold_min_spin.setValue(max_val)
-                self.cruise_hold_max_spin.setValue(min_val)
-            
-            if self.cruise_space_min_spin.value() > self.cruise_space_max_spin.value():
-                self.append_log(f"警告: 空格次数最小值({self.cruise_space_min_spin.value()})大于最大值({self.cruise_space_max_spin.value()})，已自动交换", color="red")
-                min_val = self.cruise_space_min_spin.value()
-                max_val = self.cruise_space_max_spin.value()
-                self.cruise_space_min_spin.setValue(max_val)
-                self.cruise_space_max_spin.setValue(min_val)
-        
-        self._is_running = True
-        self._stop_event.clear()
-        
-        self.start_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
-        self.unbind_btn.setEnabled(False)
-        self.apply_window_btn.setEnabled(False)
-        self._set_config_enabled(False)
-        
-        self._start_time = datetime.now()
-        self._remaining_seconds = self.duration_spin.value() * 60
-        self._countdown_timer.start(1000)
-        
-        config_info = self._get_config_info()
-        self.append_log(f"任务开始运行 | {config_info}")
-        
-        self._start_task_thread()
-        
-        self.start_clicked.emit()
-    
+        if self._selected_hwnd is not None:
+            self._save_ui_to_profile()
+        if not self._profiles:
+            self.append_log("错误: 请先绑定至少一个窗口", "red"); return
+        started = 0
+        skipped = 0
+        for hwnd in list(self._profiles.keys()):
+            s = self._sessions.get(hwnd)
+            if s and s.running:
+                skipped += 1
+                self.append_log(f"[{self._window_tag(hwnd)}] 已在运行，跳过")
+                continue
+            self._start_session(hwnd)
+            started += 1
+        if started:
+            self.append_log(f"批量开始完成：启动 {started} 个窗口，跳过 {skipped} 个窗口", "green")
+        else:
+            self.append_log("批量开始未启动新窗口，所有绑定窗口都已在运行")
+
     def _on_stop_clicked(self):
-        """停止按钮点击处理。"""
-        if not self._is_running:
+        running_hwnds = [hwnd for hwnd, s in self._sessions.items() if s.running]
+        if not running_hwnds:
+            self.append_log("当前没有正在运行的窗口任务")
             return
-        
-        self._stop_task(auto_shutdown=False)
-        
-        self.append_log("任务已停止")
-        self.stop_clicked.emit()
-    
-    def _stop_task(self, auto_shutdown: bool = True):
-        """
-        停止任务。
-        
-        Args:
-            auto_shutdown: 是否触发自动关机流程（倒计时结束时为True，手动停止为False）
-        """
-        self._is_running = False
-        self._stop_event.set()
-        self._countdown_timer.stop()
-        
-        self.start_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
-        self.unbind_btn.setEnabled(True)
-        self.apply_window_btn.setEnabled(True)
-        self._set_config_enabled(True)
-        
-        self.remaining_time_label.setText("--:--")
-        
-        if auto_shutdown and self.auto_shutdown_checkbox.isChecked():
-            self._show_shutdown_confirm()
-    
-    def _show_shutdown_confirm(self):
-        """显示关机确认对话框。"""
-        dialog = ShutdownConfirmDialog(self)
-        dialog.exec_()
-    
-    def _execute_shutdown(self):
-        """执行系统关机。"""
-        try:
-            os.system("shutdown /s /t 60")
-            self.append_log("系统将在60秒后关机，如需取消请运行: shutdown /a")
-        except Exception as e:
-            self.append_log(f"关机命令执行失败: {str(e)}")
-    
-    def _start_task_thread(self):
-        """启动任务线程。"""
-        config = self.get_config()
-        
-        def log_callback(message, color=None):
+        for hwnd in running_hwnds:
+            self._stop_session(hwnd, manual=True)
+        self.append_log(f"批量停止完成：共停止 {len(running_hwnds)} 个窗口")
+
+    def _start_session(self, hwnd: int):
+        p = self._profiles.get(hwnd)
+        if not p:
+            return
+        p.normalize()
+        stop_event = threading.Event()
+
+        def log_cb(msg, color=None):
+            s = f"[{self._window_tag(hwnd)}] {msg}"
             if color:
-                message = f"[COLOR:{color}]{message}"
-            QMetaObject.invokeMethod(
-                self,
-                "_thread_safe_append_log",
-                Qt.QueuedConnection,
-                Q_ARG(str, message)
-            )
-        
-        def task_wrapper():
+                s = f"[COLOR:{color}]" + s
+            QMetaObject.invokeMethod(self, "_thread_safe_append_log", Qt.QueuedConnection, Q_ARG(str, s))
+
+        def apply_time_adjust_resolution():
             try:
-                task_1(
-                    hwnd=self._bound_hwnd,
-                    动作=config["action_key"],
-                    间隔_min=config["interval_min"],
-                    间隔_max=config["interval_max"],
-                    任务类型=config["task_type"],
-                    随机巡航=config.get("random_cruise", False),
-                    巡航概率=config.get("cruise_probability", 50),
-                    长按最小=config.get("cruise_hold_min", 0.5),
-                    长按最大=config.get("cruise_hold_max", 1.0),
-                    空格最小=config.get("cruise_space_min", 1),
-                    空格最大=config.get("cruise_space_max", 2),
-                    stop_event=self._stop_event,
-                    log_callback=log_callback
-                )
-            except Exception as e:
-                log_callback(f"任务执行异常: {e}")
-        
-        self._task_thread = threading.Thread(target=task_wrapper, daemon=True)
-        self._task_thread.start()
-    
-    @pyqtSlot(str)
-    def _thread_safe_append_log(self, message: str):
-        """
-        线程安全的日志追加方法。
-        Args:
-            message: 日志消息（可能包含颜色标记）
-        """
-        if message.startswith("[COLOR:"):
-            end_idx = message.index("]")
-            color = message[7:end_idx]
-            actual_message = message[end_idx + 1:]
-            self.append_log(actual_message, color=color)
-        else:
-            self.append_log(message)
-    
-    def _update_countdown(self):
-        """更新倒计时显示。"""
-        if self._remaining_seconds > 0:
-            self._remaining_seconds -= 1
-            minutes = self._remaining_seconds // 60
-            seconds = self._remaining_seconds % 60
-            self.remaining_time_label.setText(f"{minutes:02d}:{seconds:02d}")
-        else:
-            self._countdown_timer.stop()
-            if self._is_running:
-                self.append_log("运行时长已到，自动停止任务")
-                self._stop_task()
-    
-    def _on_apply_window(self):
-        """应用窗口设置。"""
-        if self._bound_hwnd == 0:
-            self.append_log("错误: 未绑定窗口")
-            return
-        
-        try:
-            width = self.window_width_spin.value()
-            height = self.window_height_spin.value()
-            x = self.window_x_spin.value()
-            y = self.window_y_spin.value()
-            
-            if self.force_topmost_checkbox.isChecked():
-                hwnd_insert_after = win32con.HWND_TOPMOST
-            else:
-                hwnd_insert_after = win32con.HWND_NOTOPMOST
-            
-            win32gui.SetWindowPos(
-                self._bound_hwnd,
-                hwnd_insert_after,
-                x, y,
-                width, height,
-                win32con.SWP_SHOWWINDOW
-            )
-            
-            self.append_log(f"窗口已调整: {width}x{height} @ ({x}, {y})")
-        except Exception as e:
-            self.append_log(f"窗口调整失败: {str(e)}")
-    
-    def _on_topmost_changed(self, state):
-        """
-        置顶状态切换处理。
-        Args:
-            state: 复选框状态
-        """
-        if self._bound_hwnd == 0:
-            return
-        
-        try:
-            if state == Qt.Checked:
                 win32gui.SetWindowPos(
-                    self._bound_hwnd,
-                    win32con.HWND_TOPMOST,
-                    0, 0, 0, 0,
-                    win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_SHOWWINDOW
+                    hwnd,
+                    win32con.HWND_TOPMOST if p.time_adjust_topmost_recognition else win32con.HWND_NOTOPMOST,
+                    p.window_x,
+                    p.window_y,
+                    1000,
+                    600,
+                    win32con.SWP_SHOWWINDOW,
                 )
-                self.append_log("窗口已置顶")
-            else:
+                if p.time_adjust_topmost_recognition:
+                    log_cb("游戏时间调整前已切换分辨率为 1000x600，并启用窗口置顶识别")
+                else:
+                    log_cb("游戏时间调整前已切换分辨率为 1000x600，当前按非置顶直操作流程执行")
+            except Exception as exc:
+                log_cb(f"切换分辨率到 1000x600 失败: {exc}", "red")
+                raise
+
+        def clear_time_adjust_topmost():
+            try:
                 win32gui.SetWindowPos(
-                    self._bound_hwnd,
+                    hwnd,
                     win32con.HWND_NOTOPMOST,
                     0, 0, 0, 0,
-                    win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_SHOWWINDOW
+                    win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_SHOWWINDOW,
                 )
-                self.append_log("窗口已取消置顶")
-        except Exception as e:
-            self.append_log(f"置顶切换失败: {str(e)}")
-    
-    def _set_config_enabled(self, enabled: bool):
-        """
-        设置配置区域启用状态。
-        Args:
-            enabled: 是否启用
-        """
-        self.radio_small_account.setEnabled(enabled)
-        self.radio_host_action.setEnabled(enabled)
-        self.action_key_combo.setEnabled(enabled)
-        self.interval_min_spin.setEnabled(enabled)
-        self.interval_max_spin.setEnabled(enabled)
-        self.duration_spin.setEnabled(enabled)
-        self.auto_shutdown_checkbox.setEnabled(enabled)
-        self.window_width_spin.setEnabled(enabled)
-        self.window_height_spin.setEnabled(enabled)
-        self.window_x_spin.setEnabled(enabled)
-        self.window_y_spin.setEnabled(enabled)
-        self.random_cruise_checkbox.setEnabled(enabled)
-        if enabled:
-            self._on_random_cruise_changed(self.random_cruise_checkbox.checkState())
-        else:
-            self.cruise_probability_spin.setEnabled(False)
-            self.cruise_hold_min_spin.setEnabled(False)
-            self.cruise_hold_max_spin.setEnabled(False)
-            self.cruise_space_min_spin.setEnabled(False)
-            self.cruise_space_max_spin.setEnabled(False)
-    
-    def _get_config_info(self) -> str:
-        """
-        获取当前配置信息。
-        Returns:
-            str: 配置信息字符串
-        """
-        task_type = "小号做动作" if self.radio_small_account.isChecked() else "房主同乘做动作"
-        action_key = self.action_key_combo.currentText()
-        interval_min = self.interval_min_spin.value()
-        interval_max = self.interval_max_spin.value()
-        duration = self.duration_spin.value()
-        auto_shutdown = "是" if self.auto_shutdown_checkbox.isChecked() else "否"
-        random_cruise = "是" if self.random_cruise_checkbox.isChecked() else "否"
-        return f"类型: {task_type} | 按键: {action_key} | 间隔: {interval_min}-{interval_max}秒 | 时长: {duration}分钟 | 自动关机: {auto_shutdown} | 随机巡航: {random_cruise}"
-    
-    def append_log(self, message: str, color: str = None):
-        """
-        追加日志信息。
-        Args:
-            message: 日志消息
-            color: 文字颜色（可选，如 'red', 'green' 等）
-        """
-        from PyQt5.QtGui import QTextCharFormat, QColor
-        
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        log_entry = f"[{timestamp}] {message}"
-        
-        cursor = self.log_text.textCursor()
-        cursor.movePosition(QTextCursor.End)
-        self.log_text.setTextCursor(cursor)
-        
-        char_format = QTextCharFormat()
-        if color:
-            char_format.setForeground(QColor(color))
-        else:
-            char_format.setForeground(QColor("#d4d4d4"))
-        
-        cursor.insertText(log_entry + "\n", char_format)
-        
-        cursor.movePosition(QTextCursor.End)
-        self.log_text.setTextCursor(cursor)
-    
-    def get_bound_hwnd(self) -> int:
-        """
-        获取已绑定的窗口句柄。
-        Returns:
-            int: 窗口句柄，未绑定时返回0
-        """
-        return self._bound_hwnd
-    
-    def is_running(self) -> bool:
-        """
-        获取任务运行状态。
-        Returns:
-            bool: 是否正在运行
-        """
-        return self._is_running
-    
-    def get_config(self) -> dict:
-        """
-        获取当前配置状态。
-        Returns:
-            dict: 配置字典
-        """
-        task_type = "小号做动作" if self.radio_small_account.isChecked() else "房主同乘做动作"
-        action_key = self.action_key_combo.currentText()
-        interval_min = self.interval_min_spin.value()
-        interval_max = self.interval_max_spin.value()
-        duration = self.duration_spin.value()
-        auto_shutdown = self.auto_shutdown_checkbox.isChecked()
-        window_width = self.window_width_spin.value()
-        window_height = self.window_height_spin.value()
-        window_x = self.window_x_spin.value()
-        window_y = self.window_y_spin.value()
-        force_topmost = self.force_topmost_checkbox.isChecked()
-        random_cruise = self.random_cruise_checkbox.isChecked()
-        cruise_probability = self.cruise_probability_spin.value()
-        cruise_hold_min = self.cruise_hold_min_spin.value()
-        cruise_hold_max = self.cruise_hold_max_spin.value()
-        cruise_space_min = self.cruise_space_min_spin.value()
-        cruise_space_max = self.cruise_space_max_spin.value()
-        
-        return {
-            "task_type": task_type,
-            "action_key": action_key,
-            "interval_min": interval_min,
-            "interval_max": interval_max,
-            "duration": duration,
-            "auto_shutdown": auto_shutdown,
-            "window_width": window_width,
-            "window_height": window_height,
-            "window_x": window_x,
-            "window_y": window_y,
-            "force_topmost": force_topmost,
-            "random_cruise": random_cruise,
-            "cruise_probability": cruise_probability,
-            "cruise_hold_min": cruise_hold_min,
-            "cruise_hold_max": cruise_hold_max,
-            "cruise_space_min": cruise_space_min,
-            "cruise_space_max": cruise_space_max
-        }
-    
-    def save_config(self):
-        """保存配置到文件。"""
-        config = self.get_config()
-        config_path = get_config_file_path()
-        try:
-            with open(config_path, 'w', encoding='utf-8') as f:
-                json.dump(config, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            print(f"保存配置失败: {e}")
-    
-    def load_config(self):
-        """从文件读取配置。"""
-        config_path = get_config_file_path()
-        if not config_path.exists():
-            return
-        
-        try:
-            with open(config_path, 'r', encoding='utf-8') as f:
-                config = json.load(f)
-            
-            if "task_type" in config:
-                if config["task_type"] == "小号做动作":
-                    self.radio_small_account.setChecked(True)
+                log_cb("游戏时间调整完成，已取消窗口置顶")
+            except Exception as exc:
+                log_cb(f"取消窗口置顶失败: {exc}", "red")
+
+        def task_worker():
+            try:
+                if p.task_type == TASK_TYPE_TIME_ADJUST:
+                    while not stop_event.is_set():
+                        apply_time_adjust_resolution()
+                        log_cb("开始执行游戏时间调整")
+                        时间调整(
+                            hwnd,
+                            0,
+                            False,
+                            p.time_adjust_release_pet or p.time_adjust_use_release_pet_recognition,
+                            p.time_adjust_use_release_pet_recognition,
+                            p.time_adjust_anti_jelly,
+                            p.time_adjust_topmost_recognition,
+                            p.time_adjust_keep_open,
+                            log=log_cb,
+                            stop_event=stop_event,
+                        )
+                        clear_time_adjust_topmost()
+                        next_interval_minutes = random.uniform(p.time_adjust_interval_min, p.time_adjust_interval_max)
+                        next_interval_seconds = max(1, int(round(next_interval_minutes * 60)))
+                        log_cb(f"下一次游戏时间调整将在 {next_interval_seconds // 60}分{next_interval_seconds % 60:02d}秒后执行")
+                        if stop_event.wait(next_interval_seconds):
+                            return
                 else:
-                    self.radio_host_action.setChecked(True)
-            
-            if "action_key" in config:
-                index = self.action_key_combo.findText(config["action_key"])
-                if index >= 0:
-                    self.action_key_combo.setCurrentIndex(index)
-            
-            if "interval_min" in config:
-                self.interval_min_spin.setValue(config["interval_min"])
-            
-            if "interval_max" in config:
-                self.interval_max_spin.setValue(config["interval_max"])
-            
-            if "duration" in config:
-                self.duration_spin.setValue(config["duration"])
-            
-            if "auto_shutdown" in config:
-                self.auto_shutdown_checkbox.setChecked(config["auto_shutdown"])
-            
-            if "window_width" in config:
-                self.window_width_spin.setValue(config["window_width"])
-            
-            if "window_height" in config:
-                self.window_height_spin.setValue(config["window_height"])
-            
-            if "window_x" in config:
-                self.window_x_spin.setValue(config["window_x"])
-            
-            if "window_y" in config:
-                self.window_y_spin.setValue(config["window_y"])
-            
-            if "force_topmost" in config:
-                self.force_topmost_checkbox.setChecked(config["force_topmost"])
-            
-            if "auto_shutdown" in config:
-                self.auto_shutdown_checkbox.setChecked(config["auto_shutdown"])
-            
-            if "random_cruise" in config:
-                self.random_cruise_checkbox.setChecked(config["random_cruise"])
-            
-            if "cruise_probability" in config:
-                self.cruise_probability_spin.setValue(config["cruise_probability"])
-            
-            if "cruise_hold_min" in config:
-                self.cruise_hold_min_spin.setValue(config["cruise_hold_min"])
-            
-            if "cruise_hold_max" in config:
-                self.cruise_hold_max_spin.setValue(config["cruise_hold_max"])
-            
-            if "cruise_space_min" in config:
-                self.cruise_space_min_spin.setValue(config["cruise_space_min"])
-            
-            if "cruise_space_max" in config:
-                self.cruise_space_max_spin.setValue(config["cruise_space_max"])
-                
+                    task_1(
+                        hwnd, p.action_key, p.interval_min, p.interval_max, p.task_type,
+                        1, p.anti_jelly, p.random_cruise, p.cruise_probability, p.cruise_hold_min,
+                        p.cruise_hold_max, p.cruise_space_min, p.cruise_space_max,
+                        p.action_jump, stop_event=stop_event, log_callback=log_cb,
+                    )
+            except Exception as e:
+                log_cb(f"任务执行异常: {e}", "red")
+            finally:
+                QMetaObject.invokeMethod(self, "_on_session_thread_finished", Qt.QueuedConnection, Q_ARG(int, hwnd))
+
+        def monthly_worker():
+            try:
+                月卡关闭(hwnd, target_minute=p.monthly_card_minute, stop_event=stop_event, log=log_cb)
+            except Exception as e:
+                log_cb(f"月卡线程异常: {e}", "red")
+
+        t = threading.Thread(target=task_worker, daemon=True)
+        mt = threading.Thread(target=monthly_worker, daemon=True) if p.monthly_card_close_enabled else None
+        self._sessions[hwnd] = WindowSession(stop_event, t, mt, time.monotonic() + p.duration * 60, True)
+        t.start()
+        if mt:
+            mt.start()
+        self.append_log(f"[{self._window_tag(hwnd)}] 窗口任务开始 | 类型={p.task_type}", "green")
+        self._refresh_item(hwnd)
+        self._refresh_control_state()
+        self.start_clicked.emit()
+
+    def _stop_session(self, hwnd: int, manual=False, auto_timeout=False):
+        s = self._sessions.get(hwnd)
+        if not s or not s.running:
+            return
+        s.running = False
+        s.stop_event.set()
+        if manual:
+            self.append_log(f"[{self._window_tag(hwnd)}] 窗口任务已停止")
+            self.stop_clicked.emit()
+        elif auto_timeout:
+            self.append_log(f"[{self._window_tag(hwnd)}] 窗口运行时长已到，自动停止")
+            p = self._profiles.get(hwnd)
+            if p and p.auto_shutdown:
+                ShutdownConfirmDialog(self).exec_()
+        self._refresh_item(hwnd)
+        self._refresh_control_state()
+
+    @pyqtSlot(int)
+    def _on_session_thread_finished(self, hwnd: int):
+        s = self._sessions.get(hwnd)
+        if not s or not s.running:
+            return
+        s.running = False
+        s.stop_event.set()
+        self.append_log(f"[{self._window_tag(hwnd)}] 任务线程已结束", "green")
+        self._refresh_item(hwnd)
+        self._refresh_control_state()
+
+    def _on_ui_tick(self):
+        now = time.monotonic()
+        for hwnd, s in list(self._sessions.items()):
+            if s.running and now >= s.end_monotonic:
+                self._stop_session(hwnd, auto_timeout=True)
+        self._update_remaining()
+
+    def _update_remaining(self):
+        hwnd = self._selected_hwnd
+        if hwnd is None:
+            self.remaining_time_label.setText("--:--"); return
+        s = self._sessions.get(hwnd)
+        if not s or not s.running:
+            self.remaining_time_label.setText("--:--"); return
+        r = max(0, int(s.end_monotonic - time.monotonic()))
+        self.remaining_time_label.setText(f"{r // 60:02d}:{r % 60:02d}")
+
+    def _on_apply_window(self):
+        hwnd = self._selected_hwnd
+        if hwnd is None:
+            self.append_log("错误: 未选择窗口", "red"); return
+        self._save_ui_to_profile()
+        p = self._profiles[hwnd]
+        if not win32gui.IsWindow(hwnd):
+            self.append_log(f"窗口句柄失效: {hwnd}", "red"); return
+        try:
+            top = win32con.HWND_TOPMOST if p.force_topmost else win32con.HWND_NOTOPMOST
+            win32gui.SetWindowPos(hwnd, top, p.window_x, p.window_y, p.window_width, p.window_height, win32con.SWP_SHOWWINDOW)
+            self.append_log(f"已应用窗口参数: {p.window_width}x{p.window_height} @ ({p.window_x},{p.window_y})")
         except Exception as e:
-            print(f"读取配置失败: {e}")
-    
-    def set_target_class_name(self, class_name: str):
-        """
-        设置目标窗口类名。
-        Args:
-            class_name: 窗口类名
-        """
-        self._target_class_name = class_name
-        self.window_picker.set_target_class_name(class_name)
-    
-    def closeEvent(self, event):
-        """窗口关闭事件处理。"""
+            self.append_log(f"窗口调整失败: {e}", "red")
+
+    def _on_topmost_changed(self, state):
+        if self._loading_profile:
+            return
+        hwnd = self._selected_hwnd
+        if hwnd is None or not win32gui.IsWindow(hwnd):
+            return
+        try:
+            win32gui.SetWindowPos(
+                hwnd,
+                win32con.HWND_TOPMOST if state == Qt.Checked else win32con.HWND_NOTOPMOST,
+                0, 0, 0, 0,
+                win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_SHOWWINDOW,
+            )
+        except Exception as e:
+            self.append_log(f"置顶切换失败: {e}", "red")
+        self._on_profile_changed()
+
+    def _load_profile_to_ui(self):
+        hwnd = self._selected_hwnd
+        if hwnd is None or hwnd not in self._profiles:
+            return
+        p = self._profiles[hwnd]; p.normalize()
+        self._loading_profile = True
+        self.radio_small_account.setChecked(p.task_type == TASK_TYPE_SMALL)
+        self.radio_host_action.setChecked(p.task_type == TASK_TYPE_HOST)
+        self.radio_time_adjust.setChecked(p.task_type == TASK_TYPE_TIME_ADJUST)
+        self.action_key_combo.setCurrentText(p.action_key)
+        self.interval_min_spin.setValue(p.interval_min); self.interval_max_spin.setValue(p.interval_max)
+        self.duration_spin.setValue(p.duration)
+        self._set_time_adjust_interval_ui(p.time_adjust_interval_min, p.time_adjust_interval_max)
+        self.time_adjust_release_pet_checkbox.setChecked(p.time_adjust_release_pet)
+        self.time_adjust_use_release_pet_recognition_checkbox.setChecked(p.time_adjust_use_release_pet_recognition)
+        self.time_adjust_anti_jelly_checkbox.setChecked(p.time_adjust_anti_jelly)
+        self.time_adjust_topmost_recognition_checkbox.setChecked(p.time_adjust_topmost_recognition)
+        self.time_adjust_exit_interface_checkbox.setChecked(not p.time_adjust_keep_open)
+        if (
+            self.time_adjust_use_release_pet_recognition_checkbox.isChecked()
+            and not self.time_adjust_topmost_recognition_checkbox.isChecked()
+        ):
+            self.time_adjust_topmost_recognition_checkbox.setChecked(True)
+        self.auto_shutdown_checkbox.setChecked(p.auto_shutdown)
+        self.window_width_spin.setValue(p.window_width); self.window_height_spin.setValue(p.window_height)
+        self.window_x_spin.setValue(p.window_x); self.window_y_spin.setValue(p.window_y)
+        self.force_topmost_checkbox.setChecked(p.force_topmost)
+        self.anti_jelly_checkbox.setChecked(p.anti_jelly)
+        self.random_cruise_checkbox.setChecked(p.random_cruise)
+        self.cruise_probability_spin.setValue(p.cruise_probability)
+        self.cruise_hold_min_spin.setValue(p.cruise_hold_min); self.cruise_hold_max_spin.setValue(p.cruise_hold_max)
+        self.cruise_space_min_spin.setValue(p.cruise_space_min); self.cruise_space_max_spin.setValue(p.cruise_space_max)
+        self.action_jump_checkbox.setChecked(p.action_jump)
+        self.monthly_card_close_checkbox.setChecked(p.monthly_card_close_enabled)
+        self.monthly_card_minute_spin.setValue(p.monthly_card_minute)
+        self._on_random_cruise_changed(self.random_cruise_checkbox.checkState())
+        self.monthly_card_minute_spin.setEnabled(self.monthly_card_close_checkbox.isChecked())
+        self._update_task_type_ui()
+        self._loading_profile = False
+
+    def _save_ui_to_profile(self):
+        hwnd = self._selected_hwnd
+        if hwnd is None or hwnd not in self._profiles:
+            return
+        p = self._profiles[hwnd]
+        if self.radio_small_account.isChecked():
+            p.task_type = TASK_TYPE_SMALL
+        elif self.radio_host_action.isChecked():
+            p.task_type = TASK_TYPE_HOST
+        else:
+            p.task_type = TASK_TYPE_TIME_ADJUST
+        p.action_key = self.action_key_combo.currentText()
+        p.interval_min = self.interval_min_spin.value(); p.interval_max = self.interval_max_spin.value()
+        p.duration = self.duration_spin.value()
+        p.time_adjust_interval_min, p.time_adjust_interval_max = self._get_time_adjust_interval_values()
+        p.time_adjust_keep_open = self._is_time_adjust_keep_open_selected()
+        p.time_adjust_release_pet = self.time_adjust_release_pet_checkbox.isChecked() and not p.time_adjust_keep_open
+        p.time_adjust_use_release_pet_recognition = (
+            self.time_adjust_use_release_pet_recognition_checkbox.isChecked() and not p.time_adjust_keep_open
+        )
+        p.time_adjust_anti_jelly = self.time_adjust_anti_jelly_checkbox.isChecked() and not p.time_adjust_keep_open
+        p.time_adjust_topmost_recognition = (
+            self.time_adjust_topmost_recognition_checkbox.isChecked()
+            or p.time_adjust_use_release_pet_recognition
+        )
+        p.auto_shutdown = self.auto_shutdown_checkbox.isChecked()
+        p.window_width = self.window_width_spin.value(); p.window_height = self.window_height_spin.value()
+        p.window_x = self.window_x_spin.value(); p.window_y = self.window_y_spin.value()
+        p.force_topmost = self.force_topmost_checkbox.isChecked()
+        p.anti_jelly = self.anti_jelly_checkbox.isChecked()
+        p.random_cruise = self.random_cruise_checkbox.isChecked()
+        p.cruise_probability = self.cruise_probability_spin.value()
+        p.cruise_hold_min = self.cruise_hold_min_spin.value(); p.cruise_hold_max = self.cruise_hold_max_spin.value()
+        p.cruise_space_min = self.cruise_space_min_spin.value(); p.cruise_space_max = self.cruise_space_max_spin.value()
+        p.action_jump = self.action_jump_checkbox.isChecked()
+        p.monthly_card_close_enabled = self.monthly_card_close_checkbox.isChecked()
+        p.monthly_card_minute = self.monthly_card_minute_spin.value()
+        p.normalize(); self.save_config()
+
+    def _refresh_control_state(self):
+        sel = self._selected_hwnd is not None
+        self.unbind_btn.setEnabled(sel)
+        self.apply_window_btn.setEnabled(sel)
+        self.force_topmost_checkbox.setEnabled(sel)
+        self.start_btn.setEnabled(bool(self._profiles))
+        self.stop_btn.setEnabled(any(s.running for s in self._sessions.values()))
+        self.bound_count_label.setText(f"已绑定: {self.bound_windows_list.count()}")
+        self.running_count_label.setText(str(sum(1 for s in self._sessions.values() if s.running)))
+
+    @pyqtSlot(str)
+    def _thread_safe_append_log(self, msg: str):
+        if msg.startswith("[COLOR:"):
+            i = msg.index("]")
+            self.append_log(msg[i + 1 :], msg[7:i])
+        else:
+            self.append_log(msg)
+
+    def append_log(self, msg: str, color: str = None):
+        ts = datetime.now().strftime("%H:%M:%S")
+        cursor = self.log_text.textCursor(); cursor.movePosition(QTextCursor.End)
+        fmt = QTextCharFormat(); fmt.setForeground(QColor(color) if color else QColor("#d4d4d4"))
+        cursor.insertText(f"[{ts}] {msg}\n", fmt)
+        self.log_text.setTextCursor(cursor)
+        self.log_text.ensureCursorVisible()
+    def _qt_key_to_vk(self, key: int) -> Optional[int]:
+        if 0x30 <= key <= 0x39 or 0x41 <= key <= 0x5A:
+            return key
+        if Qt.Key_F1 <= key <= Qt.Key_F24:
+            return win32con.VK_F1 + (key - Qt.Key_F1)
+        m = {
+            Qt.Key_Space: win32con.VK_SPACE,
+            Qt.Key_Tab: win32con.VK_TAB,
+            Qt.Key_Escape: win32con.VK_ESCAPE,
+            Qt.Key_Return: win32con.VK_RETURN,
+            Qt.Key_Enter: win32con.VK_RETURN,
+            Qt.Key_Delete: win32con.VK_DELETE,
+            Qt.Key_Insert: win32con.VK_INSERT,
+            Qt.Key_Home: win32con.VK_HOME,
+            Qt.Key_End: win32con.VK_END,
+            Qt.Key_PageUp: win32con.VK_PRIOR,
+            Qt.Key_PageDown: win32con.VK_NEXT,
+            Qt.Key_Left: win32con.VK_LEFT,
+            Qt.Key_Right: win32con.VK_RIGHT,
+            Qt.Key_Up: win32con.VK_UP,
+            Qt.Key_Down: win32con.VK_DOWN,
+        }
+        return m.get(key)
+
+    def _parse_hotkey(self, seq: QKeySequence) -> Optional[Tuple[int, int]]:
+        if seq.isEmpty():
+            return None
+        k = int(seq[0]); mods = 0
+        if k & Qt.CTRL: mods |= MOD_CONTROL
+        if k & Qt.ALT: mods |= MOD_ALT
+        if k & Qt.SHIFT: mods |= MOD_SHIFT
+        if k & Qt.META: mods |= MOD_WIN
+        base = k & ~(Qt.CTRL | Qt.ALT | Qt.SHIFT | Qt.META)
+        vk = self._qt_key_to_vk(base)
+        return None if mods == 0 or vk is None else (mods, vk)
+
+    def _register_hotkeys(self):
+        self._unregister_hotkeys()
+        start = self._parse_hotkey(self._start_hotkey_seq)
+        stop = self._parse_hotkey(self._stop_hotkey_seq)
+        if not start or not stop:
+            self.append_log("热键格式无效，需要修饰键(Ctrl/Alt/Shift/Win)", "red")
+            return
+        u = ctypes.windll.user32
+        hwnd = int(self.winId())
+        ok1 = bool(u.RegisterHotKey(hwnd, HOTKEY_ID_START, start[0], start[1]))
+        ok2 = bool(u.RegisterHotKey(hwnd, HOTKEY_ID_STOP, stop[0], stop[1]))
+        if not ok1 or not ok2:
+            err = ctypes.get_last_error()
+            if ok1: u.UnregisterHotKey(hwnd, HOTKEY_ID_START)
+            if ok2: u.UnregisterHotKey(hwnd, HOTKEY_ID_STOP)
+            self.append_log(f"全局热键注册失败，可能冲突 (err={err})", "red")
+            return
+        self.append_log(
+            "热键已生效: 开始=" + self._start_hotkey_seq.toString(QKeySequence.NativeText)
+            + " | 停止=" + self._stop_hotkey_seq.toString(QKeySequence.NativeText),
+            "green",
+        )
+
+    def _unregister_hotkeys(self):
+        u = ctypes.windll.user32
+        hwnd = int(self.winId())
+        u.UnregisterHotKey(hwnd, HOTKEY_ID_START)
+        u.UnregisterHotKey(hwnd, HOTKEY_ID_STOP)
+
+    def _on_apply_hotkeys(self):
+        self._start_hotkey_seq = self.start_hotkey_edit.keySequence()
+        self._stop_hotkey_seq = self.stop_hotkey_edit.keySequence()
+        self._register_hotkeys()
         self.save_config()
-        if self._is_running:
-            self._stop_event.set()
+
+    def _hotkey_start_selected(self):
+        self._on_start_clicked()
+
+    def _hotkey_stop_selected(self):
+        self._on_stop_clicked()
+
+    def nativeEvent(self, eventType, message):
+        if eventType in ("windows_generic_MSG", "windows_dispatcher_MSG"):
+            msg = ctypes.wintypes.MSG.from_address(int(message))
+            if msg.message == win32con.WM_HOTKEY:
+                wid = int(msg.wParam)
+                if wid == HOTKEY_ID_START: QTimer.singleShot(0, self._hotkey_start_selected)
+                elif wid == HOTKEY_ID_STOP: QTimer.singleShot(0, self._hotkey_stop_selected)
+                return True, 0
+        return super().nativeEvent(eventType, message)
+
+    def save_config(self):
+        p = get_config_file_path()
+        data = {
+            "hotkeys": {
+                "start": self._start_hotkey_seq.toString(QKeySequence.PortableText),
+                "stop": self._stop_hotkey_seq.toString(QKeySequence.PortableText),
+            },
+            "window_profiles": {str(hwnd): prof.to_dict() for hwnd, prof in self._profiles.items()},
+        }
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def load_config(self):
+        p = get_config_file_path()
+        if not p.exists():
+            return
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                d = json.load(f)
+        except Exception as e:
+            self.append_log(f"读取配置失败: {e}", "red")
+            return
+        if isinstance(d, dict) and "window_profiles" in d:
+            hk = d.get("hotkeys", {})
+            s = hk.get("start", "")
+            t = hk.get("stop", "")
+            if s:
+                self._start_hotkey_seq = QKeySequence(s, QKeySequence.PortableText)
+                self.start_hotkey_edit.setKeySequence(self._start_hotkey_seq)
+            if t:
+                self._stop_hotkey_seq = QKeySequence(t, QKeySequence.PortableText)
+                self.stop_hotkey_edit.setKeySequence(self._stop_hotkey_seq)
+            for k, v in d.get("window_profiles", {}).items():
+                try:
+                    hwnd = int(k)
+                except Exception:
+                    continue
+                self._profiles[hwnd] = WindowProfile.from_dict(v or {})
+                it = QListWidgetItem(self._item_text(hwnd)); it.setData(Qt.UserRole, hwnd)
+                self.bound_windows_list.addItem(it)
+        else:
+            self._legacy_default = WindowProfile.from_dict(d if isinstance(d, dict) else {})
+        if self.bound_windows_list.count() > 0:
+            self.bound_windows_list.setCurrentRow(0)
+
+    def closeEvent(self, event):
+        for hwnd in list(self._sessions.keys()):
+            self._stop_session(hwnd, manual=False)
+        self._unregister_hotkeys()
+        self.save_config()
         event.accept()
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    
-    is_authorized, result = check_license()
-    
-    if not is_authorized:
-        dialog = LicenseDialog(result)
-        if dialog.exec_() == QDialog.Rejected:
+    authorized, result = check_license()
+    if not authorized:
+        dlg = LicenseDialog(result)
+        if dlg.exec_() == QDialog.Rejected:
             sys.exit(0)
         sys.exit(0)
-    
+
     try:
-        import ctypes
         is_admin = ctypes.windll.shell32.IsUserAnAdmin()
     except Exception:
         is_admin = False
-    
     if not is_admin:
-        QMessageBox.warning(
-            None,
-            "提示",
-            "请右键程序图标，选择「以管理员身份运行」\n\n否则部分功能可能无法正常使用。",
-            QMessageBox.Ok
-        )
-    
-    window = MainWindow(target_class_name="UnrealWindow")
-    window.start_clicked.connect(lambda: print("开始信号发射"))
-    window.stop_clicked.connect(lambda: print("停止信号发射"))
-    window.show()
-    
+        QMessageBox.warning(None, "提示", "请右键程序图标，选择「以管理员身份运行」。")
+
+    w = MainWindow(target_class_name="UnrealWindow")
+    w.show()
     sys.exit(app.exec_())
