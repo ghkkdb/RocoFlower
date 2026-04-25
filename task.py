@@ -1,5 +1,6 @@
 import random
 import threading
+import time
 from datetime import datetime, timedelta
 from typing import Callable, Optional
 
@@ -8,11 +9,14 @@ import win32gui
 
 from tools import (
     activate_window,
+    background_key_down,
+    background_key_up,
     click_mouse,
     deactivate_window,
     humanized_key_press,
     humanized_sleep,
     match_template_in_window_foreground,
+    long_press_key,
 )
 
 
@@ -504,7 +508,6 @@ def 时间调整(
 
     emit("未找到传送石触碰按钮，无法调整时间！！！请手动调整", color="red")
 
-
 def 月卡关闭(
     hwnd,
     target_minute=1,
@@ -550,3 +553,106 @@ def 月卡关闭(
             next_run = today_target + timedelta(days=1)
 
         _wait_or_stop(stop_event, min((next_run - now).total_seconds(), 1.0))
+
+
+def 刷鬼火(
+    hwnd: int,
+    mode: str = "hold_w",
+    ad_interval_min: float = 0.15,
+    ad_interval_max: float = 0.15,
+    press_duration_min: float = 0.08,
+    press_duration_max: float = 0.08,
+    jump_interval_min: float = 2.0,
+    jump_interval_max: float = 4.0,
+    stop_event: threading.Event = None,
+    log: Logger = None,
+):
+    if stop_event is None:
+        stop_event = threading.Event()
+
+    mode = str(mode or "hold_w").lower()
+    ad_interval_min = max(0.05, float(ad_interval_min))
+    ad_interval_max = max(0.05, float(ad_interval_max))
+    press_duration_min = max(0.01, float(press_duration_min))
+    press_duration_max = max(0.01, float(press_duration_max))
+    jump_interval_min = max(0.1, float(jump_interval_min))
+    jump_interval_max = max(0.1, float(jump_interval_max))
+    if ad_interval_min > ad_interval_max:
+        ad_interval_min, ad_interval_max = ad_interval_max, ad_interval_min
+    if press_duration_min > press_duration_max:
+        press_duration_min, press_duration_max = press_duration_max, press_duration_min
+    if jump_interval_min > jump_interval_max:
+        jump_interval_min, jump_interval_max = jump_interval_max, jump_interval_min
+
+    def sample_range(min_value: float, max_value: float) -> float:
+        return random.uniform(min_value, max_value)
+
+    if mode == "hold_w":
+        _emit_log(log, "开始执行刷鬼火，模式: 长按 [W]", "green")
+        pressed = False
+        try:
+            pressed = background_key_down(hwnd, "W")
+            if not pressed:
+                _emit_log(log, "刷鬼火执行失败，长按 [W] 未成功按下", "red")
+                return
+            while not stop_event.is_set():
+                if _wait_or_stop(stop_event, 0.1):
+                    break
+        finally:
+            if pressed:
+                background_key_up(hwnd, "W")
+        _emit_log(log, "刷鬼火已停止，已释放 [W]", "green")
+        return
+
+    if mode == "ad_loop":
+        _emit_log(
+            log,
+            f"开始执行刷鬼火，模式: 循环短按 [A/D]，按住 {press_duration_min:.2f}-{press_duration_max:.2f} 秒，间隔 {ad_interval_min:.2f}-{ad_interval_max:.2f} 秒",
+            "green",
+        )
+        next_key = "A"
+        while not stop_event.is_set():
+            press_duration = sample_range(press_duration_min, press_duration_max)
+            if not long_press_key(
+                hwnd,
+                next_key,
+                press_duration,
+                enable_hesitation=False,
+                stop_event=stop_event,
+            ):
+                if not stop_event.is_set():
+                    _emit_log(log, f"刷鬼火执行失败，短按 [{next_key}] 未成功完成", "red")
+                break
+            next_key = "D" if next_key == "A" else "A"
+            wait_duration = sample_range(ad_interval_min, ad_interval_max)
+            if _wait_or_stop(stop_event, wait_duration):
+                break
+
+        _emit_log(log, "刷鬼火已停止，A/D 循环已结束", "green")
+        return
+
+    if mode == "jump":
+        _emit_log(
+            log,
+            f"开始执行刷鬼火，模式: 跳跃 [Space]，间隔 {jump_interval_min:.2f}-{jump_interval_max:.2f} 秒",
+            "green",
+        )
+        while not stop_event.is_set():
+            if not humanized_key_press(
+                hwnd,
+                "Space",
+                enable_hesitation=False,
+                enable_rhythm=False,
+                stop_event=stop_event,
+            ):
+                if not stop_event.is_set():
+                    _emit_log(log, "刷鬼火执行失败，跳跃 [Space] 未成功完成", "red")
+                break
+            wait_duration = sample_range(jump_interval_min, jump_interval_max)
+            if _wait_or_stop(stop_event, wait_duration):
+                break
+
+        _emit_log(log, "刷鬼火已停止，跳跃循环已结束", "green")
+        return
+
+    _emit_log(log, f"刷鬼火执行失败，未知模式: {mode}", "red")

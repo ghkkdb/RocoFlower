@@ -924,7 +924,16 @@ def _interruptible_wait(
     if stop_event is None:
         time.sleep(duration)
         return False
-    return stop_event.wait(duration)
+    max_chunk = 3600.0
+    remaining = duration
+    while remaining > 0:
+        if stop_event.is_set():
+            return True
+        current_chunk = min(remaining, max_chunk)
+        if stop_event.wait(current_chunk):
+            return True
+        remaining -= current_chunk
+    return bool(stop_event.is_set())
 
 
 def humanized_key_press(

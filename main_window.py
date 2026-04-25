@@ -26,6 +26,7 @@ from PyQt5.QtWidgets import (
 
 from auth import check_license
 from drag_window_picker import DragWindowPicker
+from ghost_fire import 刷鬼火
 from task import task_1, 月卡关闭, 时间调整
 
 MOD_ALT = 0x0001
@@ -34,9 +35,15 @@ MOD_SHIFT = 0x0004
 MOD_WIN = 0x0008
 HOTKEY_ID_START = 0x5001
 HOTKEY_ID_STOP = 0x5002
+APP_VERSION = "2.5.4"
+APP_TITLE = f"RocoFlower V{APP_VERSION}【咸鱼：KKDB】"
 TASK_TYPE_SMALL = "小号做动作"
 TASK_TYPE_HOST = "房主同乘做动作"
 TASK_TYPE_TIME_ADJUST = "游戏时间调整"
+TASK_TYPE_GHOST_FIRE = "刷鬼火"
+GHOST_FIRE_MODE_HOLD_W = "长按W"
+GHOST_FIRE_MODE_AD_LOOP = "循环短按A/D"
+GHOST_FIRE_MODE_JUMP = "跳跃"
 
 
 def get_app_dir() -> Path:
@@ -92,6 +99,13 @@ class WindowProfile:
     cruise_space_min: int = 0
     cruise_space_max: int = 1
     action_jump: bool = True
+    ghost_fire_mode: str = "hold_w"
+    ghost_fire_ad_interval_min: float = 0.15
+    ghost_fire_ad_interval_max: float = 0.2
+    ghost_fire_press_duration_min: float = 0.3
+    ghost_fire_press_duration_max: float = 0.5
+    ghost_fire_jump_interval_min: float = 6.0
+    ghost_fire_jump_interval_max: float = 8.0
     monthly_card_close_enabled: bool = False
     monthly_card_minute: int = 1
     window_title: str = ""
@@ -103,6 +117,12 @@ class WindowProfile:
         for k in p.__dataclass_fields__:
             if k in d:
                 setattr(p, k, d[k])
+        if "ghost_fire_ad_interval" in d:
+            p.ghost_fire_ad_interval_min = d["ghost_fire_ad_interval"]
+            p.ghost_fire_ad_interval_max = d["ghost_fire_ad_interval"]
+        if "ghost_fire_press_duration" in d:
+            p.ghost_fire_press_duration_min = d["ghost_fire_press_duration"]
+            p.ghost_fire_press_duration_max = d["ghost_fire_press_duration"]
         if "time_adjust_interval_minutes" in d:
             p.time_adjust_interval_min = d["time_adjust_interval_minutes"]
             p.time_adjust_interval_max = d["time_adjust_interval_minutes"]
@@ -116,7 +136,7 @@ class WindowProfile:
         return {k: getattr(self, k) for k in self.__dataclass_fields__}
 
     def normalize(self):
-        if self.task_type not in (TASK_TYPE_SMALL, TASK_TYPE_HOST, TASK_TYPE_TIME_ADJUST):
+        if self.task_type not in (TASK_TYPE_SMALL, TASK_TYPE_HOST, TASK_TYPE_TIME_ADJUST, TASK_TYPE_GHOST_FIRE):
             self.task_type = TASK_TYPE_SMALL
         self.action_key = str(self.action_key)
         if self.action_key not in {"1", "2", "3", "4", "5"}:
@@ -143,6 +163,20 @@ class WindowProfile:
         self.cruise_space_max = max(0, int(self.cruise_space_max))
         if self.cruise_space_min > self.cruise_space_max:
             self.cruise_space_min, self.cruise_space_max = self.cruise_space_max, self.cruise_space_min
+        if self.ghost_fire_mode not in {"hold_w", "ad_loop", "jump"}:
+            self.ghost_fire_mode = "hold_w"
+        self.ghost_fire_ad_interval_min = max(0.05, float(self.ghost_fire_ad_interval_min))
+        self.ghost_fire_ad_interval_max = max(0.05, float(self.ghost_fire_ad_interval_max))
+        if self.ghost_fire_ad_interval_min > self.ghost_fire_ad_interval_max:
+            self.ghost_fire_ad_interval_min, self.ghost_fire_ad_interval_max = self.ghost_fire_ad_interval_max, self.ghost_fire_ad_interval_min
+        self.ghost_fire_press_duration_min = max(0.01, float(self.ghost_fire_press_duration_min))
+        self.ghost_fire_press_duration_max = max(0.01, float(self.ghost_fire_press_duration_max))
+        if self.ghost_fire_press_duration_min > self.ghost_fire_press_duration_max:
+            self.ghost_fire_press_duration_min, self.ghost_fire_press_duration_max = self.ghost_fire_press_duration_max, self.ghost_fire_press_duration_min
+        self.ghost_fire_jump_interval_min = max(0.1, float(self.ghost_fire_jump_interval_min))
+        self.ghost_fire_jump_interval_max = max(0.1, float(self.ghost_fire_jump_interval_max))
+        if self.ghost_fire_jump_interval_min > self.ghost_fire_jump_interval_max:
+            self.ghost_fire_jump_interval_min, self.ghost_fire_jump_interval_max = self.ghost_fire_jump_interval_max, self.ghost_fire_jump_interval_min
         self.monthly_card_minute = min(5, max(1, int(self.monthly_card_minute)))
 
 
@@ -260,7 +294,7 @@ class MainWindow(QMainWindow):
         self._refresh_control_state()
 
     def _init_ui(self):
-        self.setWindowTitle("RocoFlower V2.5.3")
+        self.setWindowTitle(APP_TITLE)
         self.resize(800, 760)
         root = QWidget(); self.setCentralWidget(root)
         main = QVBoxLayout(root)
@@ -343,12 +377,15 @@ class MainWindow(QMainWindow):
         self.radio_small_account = QRadioButton(TASK_TYPE_SMALL)
         self.radio_host_action = QRadioButton(TASK_TYPE_HOST)
         self.radio_time_adjust = QRadioButton(TASK_TYPE_TIME_ADJUST)
+        self.radio_ghost_fire = QRadioButton(TASK_TYPE_GHOST_FIRE)
         self.task_type_group.addButton(self.radio_small_account, 0)
         self.task_type_group.addButton(self.radio_host_action, 1)
         self.task_type_group.addButton(self.radio_time_adjust, 2)
+        self.task_type_group.addButton(self.radio_ghost_fire, 3)
         task_type_row.addWidget(self.radio_small_account)
         task_type_row.addWidget(self.radio_host_action)
         task_type_row.addWidget(self.radio_time_adjust)
+        task_type_row.addWidget(self.radio_ghost_fire)
         task_type_row.addStretch()
         v.addLayout(task_type_row)
 
@@ -406,7 +443,69 @@ class MainWindow(QMainWindow):
         action_row_2.addWidget(QLabel("空格:")); action_row_2.addWidget(self.cruise_space_min_spin); action_row_2.addWidget(QLabel("-")); action_row_2.addWidget(self.cruise_space_max_spin)
         action_row_2.addStretch()
         action_layout.addLayout(action_row_2)
+        self.host_action_hint_label = QLabel("房主同乘做动作模式如带人请关闭防变果冻")
+        self.host_action_hint_label.setWordWrap(True)
+        self.host_action_hint_label.setStyleSheet("color: #d9534f;")
+        action_layout.addWidget(self.host_action_hint_label)
         v.addWidget(self.action_task_group)
+
+        self.ghost_fire_group = QGroupBox("刷鬼火配置")
+        ghost_fire_layout = QVBoxLayout(self.ghost_fire_group)
+        ghost_fire_row = QHBoxLayout()
+        ghost_fire_row.addWidget(QLabel("执行模式:"))
+        self.ghost_fire_mode_combo = QComboBox()
+        self.ghost_fire_mode_combo.addItem(GHOST_FIRE_MODE_HOLD_W, "hold_w")
+        self.ghost_fire_mode_combo.addItem(GHOST_FIRE_MODE_AD_LOOP, "ad_loop")
+        self.ghost_fire_mode_combo.addItem(GHOST_FIRE_MODE_JUMP, "jump")
+        ghost_fire_row.addWidget(self.ghost_fire_mode_combo)
+        ghost_fire_row.addSpacing(20)
+        ghost_fire_row.addWidget(QLabel("短按时长(秒):"))
+        self.ghost_fire_press_duration_min_spin = QDoubleSpinBox()
+        self.ghost_fire_press_duration_min_spin.setRange(0.01, 2.0)
+        self.ghost_fire_press_duration_min_spin.setSingleStep(0.01)
+        self.ghost_fire_press_duration_min_spin.setDecimals(2)
+        self.ghost_fire_press_duration_max_spin = QDoubleSpinBox()
+        self.ghost_fire_press_duration_max_spin.setRange(0.01, 2.0)
+        self.ghost_fire_press_duration_max_spin.setSingleStep(0.01)
+        self.ghost_fire_press_duration_max_spin.setDecimals(2)
+        ghost_fire_row.addWidget(self.ghost_fire_press_duration_min_spin)
+        ghost_fire_row.addWidget(QLabel("-"))
+        ghost_fire_row.addWidget(self.ghost_fire_press_duration_max_spin)
+        ghost_fire_row.addSpacing(20)
+        ghost_fire_row.addWidget(QLabel("A/D 间隔(秒):"))
+        self.ghost_fire_ad_interval_min_spin = QDoubleSpinBox()
+        self.ghost_fire_ad_interval_min_spin.setRange(0.05, 5.0)
+        self.ghost_fire_ad_interval_min_spin.setSingleStep(0.05)
+        self.ghost_fire_ad_interval_min_spin.setDecimals(2)
+        self.ghost_fire_ad_interval_max_spin = QDoubleSpinBox()
+        self.ghost_fire_ad_interval_max_spin.setRange(0.05, 5.0)
+        self.ghost_fire_ad_interval_max_spin.setSingleStep(0.05)
+        self.ghost_fire_ad_interval_max_spin.setDecimals(2)
+        ghost_fire_row.addWidget(self.ghost_fire_ad_interval_min_spin)
+        ghost_fire_row.addWidget(QLabel("-"))
+        ghost_fire_row.addWidget(self.ghost_fire_ad_interval_max_spin)
+        ghost_fire_row.addStretch()
+        ghost_fire_layout.addLayout(ghost_fire_row)
+        ghost_fire_jump_row = QHBoxLayout()
+        ghost_fire_jump_row.addWidget(QLabel("跳跃间隔(秒):"))
+        self.ghost_fire_jump_interval_min_spin = QDoubleSpinBox()
+        self.ghost_fire_jump_interval_min_spin.setRange(0.1, 30.0)
+        self.ghost_fire_jump_interval_min_spin.setSingleStep(0.1)
+        self.ghost_fire_jump_interval_min_spin.setDecimals(2)
+        self.ghost_fire_jump_interval_max_spin = QDoubleSpinBox()
+        self.ghost_fire_jump_interval_max_spin.setRange(0.1, 30.0)
+        self.ghost_fire_jump_interval_max_spin.setSingleStep(0.1)
+        self.ghost_fire_jump_interval_max_spin.setDecimals(2)
+        ghost_fire_jump_row.addWidget(self.ghost_fire_jump_interval_min_spin)
+        ghost_fire_jump_row.addWidget(QLabel("-"))
+        ghost_fire_jump_row.addWidget(self.ghost_fire_jump_interval_max_spin)
+        ghost_fire_jump_row.addStretch()
+        ghost_fire_layout.addLayout(ghost_fire_jump_row)
+        self.ghost_fire_hint_label = QLabel("说明：循环短按A/D模式会按 A、D 成对执行，并尽量使用同一组短按时长来减少角色位置偏移。")
+        self.ghost_fire_hint_label.setWordWrap(True)
+        self.ghost_fire_hint_label.setStyleSheet("color: #666;")
+        ghost_fire_layout.addWidget(self.ghost_fire_hint_label)
+        v.addWidget(self.ghost_fire_group)
 
         self.time_adjust_group = QGroupBox("游戏时间调整配置")
         time_adjust_layout = QVBoxLayout(self.time_adjust_group)
@@ -470,6 +569,13 @@ class MainWindow(QMainWindow):
         self.time_adjust_anti_jelly_checkbox.setChecked(False)
         self.time_adjust_topmost_recognition_checkbox.setChecked(False)
         self.time_adjust_exit_interface_checkbox.setChecked(True)
+        self.ghost_fire_mode_combo.setCurrentIndex(0)
+        self.ghost_fire_press_duration_min_spin.setValue(0.3)
+        self.ghost_fire_press_duration_max_spin.setValue(0.5)
+        self.ghost_fire_ad_interval_min_spin.setValue(0.15)
+        self.ghost_fire_ad_interval_max_spin.setValue(0.2)
+        self.ghost_fire_jump_interval_min_spin.setValue(6.0)
+        self.ghost_fire_jump_interval_max_spin.setValue(8.0)
         self.monthly_card_minute_spin.setValue(1)
         self.monthly_card_minute_spin.setEnabled(False)
         self._update_task_type_ui()
@@ -528,12 +634,14 @@ class MainWindow(QMainWindow):
         self.radio_small_account.toggled.connect(self._on_task_type_changed)
         self.radio_host_action.toggled.connect(self._on_task_type_changed)
         self.radio_time_adjust.toggled.connect(self._on_task_type_changed)
+        self.radio_ghost_fire.toggled.connect(self._on_task_type_changed)
+        self.ghost_fire_mode_combo.currentIndexChanged.connect(self._on_ghost_fire_mode_changed)
         self.apply_hotkey_btn.clicked.connect(self._on_apply_hotkeys)
         self._connect_profile_signals()
 
     def _connect_profile_signals(self):
         ctrls = [
-            self.radio_small_account, self.radio_host_action, self.radio_time_adjust, self.action_key_combo,
+            self.radio_small_account, self.radio_host_action, self.radio_time_adjust, self.radio_ghost_fire, self.action_key_combo,
             self.interval_min_spin, self.interval_max_spin, self.duration_spin,
             self.time_adjust_interval_min_minute_spin, self.time_adjust_interval_min_second_spin,
             self.time_adjust_interval_max_minute_spin, self.time_adjust_interval_max_second_spin,
@@ -542,6 +650,9 @@ class MainWindow(QMainWindow):
             self.anti_jelly_checkbox,
             self.random_cruise_checkbox, self.cruise_probability_spin, self.cruise_hold_min_spin,
             self.cruise_hold_max_spin, self.cruise_space_min_spin, self.cruise_space_max_spin,
+            self.ghost_fire_mode_combo, self.ghost_fire_press_duration_min_spin, self.ghost_fire_press_duration_max_spin,
+            self.ghost_fire_ad_interval_min_spin, self.ghost_fire_ad_interval_max_spin,
+            self.ghost_fire_jump_interval_min_spin, self.ghost_fire_jump_interval_max_spin,
             self.action_jump_checkbox, self.time_adjust_release_pet_checkbox,
             self.time_adjust_use_release_pet_recognition_checkbox, self.time_adjust_anti_jelly_checkbox,
             self.time_adjust_topmost_recognition_checkbox, self.time_adjust_exit_interface_checkbox, self.monthly_card_close_checkbox,
@@ -606,6 +717,10 @@ class MainWindow(QMainWindow):
         self.time_adjust_anti_jelly_checkbox.setEnabled(self._is_time_adjust_selected() and not keep_open)
         self._on_profile_changed()
 
+    def _on_ghost_fire_mode_changed(self, *_):
+        self._update_task_type_ui()
+        self._on_profile_changed()
+
     def _set_time_adjust_interval_ui(self, min_minutes: float, max_minutes: float):
         min_m, min_s = _minutes_to_minute_second_parts(min_minutes)
         max_m, max_s = _minutes_to_minute_second_parts(max_minutes)
@@ -635,17 +750,33 @@ class MainWindow(QMainWindow):
     def _is_time_adjust_keep_open_selected(self) -> bool:
         return not self.time_adjust_exit_interface_checkbox.isChecked()
 
+    def _is_host_action_selected(self) -> bool:
+        return self.radio_host_action.isChecked()
+
     def _update_task_type_ui(self):
         is_time_adjust = self._is_time_adjust_selected()
-        self.action_task_group.setEnabled(not is_time_adjust)
+        is_host_action = self._is_host_action_selected()
+        is_ghost_fire = self.radio_ghost_fire.isChecked()
+        is_action_task = not is_time_adjust and not is_ghost_fire
+        self.action_task_group.setEnabled(is_action_task)
+        self.ghost_fire_group.setEnabled(is_ghost_fire)
         self.time_adjust_group.setEnabled(is_time_adjust)
-        self.random_cruise_checkbox.setEnabled(not is_time_adjust)
-        cruise_enabled = not is_time_adjust and self.random_cruise_checkbox.isChecked()
+        self.host_action_hint_label.setVisible(is_host_action)
+        self.random_cruise_checkbox.setEnabled(is_action_task)
+        cruise_enabled = is_action_task and self.random_cruise_checkbox.isChecked()
         self.cruise_probability_spin.setEnabled(cruise_enabled)
         self.cruise_hold_min_spin.setEnabled(cruise_enabled)
         self.cruise_hold_max_spin.setEnabled(cruise_enabled)
         self.cruise_space_min_spin.setEnabled(cruise_enabled)
         self.cruise_space_max_spin.setEnabled(cruise_enabled)
+        ad_loop_enabled = is_ghost_fire and self.ghost_fire_mode_combo.currentData() == "ad_loop"
+        jump_mode_enabled = is_ghost_fire and self.ghost_fire_mode_combo.currentData() == "jump"
+        self.ghost_fire_press_duration_min_spin.setEnabled(ad_loop_enabled)
+        self.ghost_fire_press_duration_max_spin.setEnabled(ad_loop_enabled)
+        self.ghost_fire_ad_interval_min_spin.setEnabled(ad_loop_enabled)
+        self.ghost_fire_ad_interval_max_spin.setEnabled(ad_loop_enabled)
+        self.ghost_fire_jump_interval_min_spin.setEnabled(jump_mode_enabled)
+        self.ghost_fire_jump_interval_max_spin.setEnabled(jump_mode_enabled)
         self.time_adjust_release_pet_checkbox.setEnabled(is_time_adjust and not self._is_time_adjust_keep_open_selected())
         self.time_adjust_use_release_pet_recognition_checkbox.setEnabled(
             is_time_adjust and not self._is_time_adjust_keep_open_selected()
@@ -655,6 +786,8 @@ class MainWindow(QMainWindow):
         self.time_adjust_exit_interface_checkbox.setEnabled(is_time_adjust)
 
     def _on_task_type_changed(self, *_):
+        if not self._loading_profile and self._is_host_action_selected() and self.anti_jelly_checkbox.isChecked():
+            self.anti_jelly_checkbox.setChecked(False)
         self._update_task_type_ui()
         self._on_profile_changed()
 
@@ -841,6 +974,19 @@ class MainWindow(QMainWindow):
                         log_cb(f"下一次游戏时间调整将在 {next_interval_seconds // 60}分{next_interval_seconds % 60:02d}秒后执行")
                         if stop_event.wait(next_interval_seconds):
                             return
+                elif p.task_type == TASK_TYPE_GHOST_FIRE:
+                    刷鬼火(
+                        hwnd,
+                        mode=p.ghost_fire_mode,
+                        ad_interval_min=p.ghost_fire_ad_interval_min,
+                        ad_interval_max=p.ghost_fire_ad_interval_max,
+                        press_duration_min=p.ghost_fire_press_duration_min,
+                        press_duration_max=p.ghost_fire_press_duration_max,
+                        jump_interval_min=p.ghost_fire_jump_interval_min,
+                        jump_interval_max=p.ghost_fire_jump_interval_max,
+                        stop_event=stop_event,
+                        log=log_cb,
+                    )
                 else:
                     task_1(
                         hwnd, p.action_key, p.interval_min, p.interval_max, p.task_type,
@@ -956,6 +1102,7 @@ class MainWindow(QMainWindow):
         self.radio_small_account.setChecked(p.task_type == TASK_TYPE_SMALL)
         self.radio_host_action.setChecked(p.task_type == TASK_TYPE_HOST)
         self.radio_time_adjust.setChecked(p.task_type == TASK_TYPE_TIME_ADJUST)
+        self.radio_ghost_fire.setChecked(p.task_type == TASK_TYPE_GHOST_FIRE)
         self.action_key_combo.setCurrentText(p.action_key)
         self.interval_min_spin.setValue(p.interval_min); self.interval_max_spin.setValue(p.interval_max)
         self.duration_spin.setValue(p.duration)
@@ -979,10 +1126,19 @@ class MainWindow(QMainWindow):
         self.cruise_probability_spin.setValue(p.cruise_probability)
         self.cruise_hold_min_spin.setValue(p.cruise_hold_min); self.cruise_hold_max_spin.setValue(p.cruise_hold_max)
         self.cruise_space_min_spin.setValue(p.cruise_space_min); self.cruise_space_max_spin.setValue(p.cruise_space_max)
+        ghost_fire_mode_index = self.ghost_fire_mode_combo.findData(p.ghost_fire_mode)
+        self.ghost_fire_mode_combo.setCurrentIndex(ghost_fire_mode_index if ghost_fire_mode_index >= 0 else 0)
+        self.ghost_fire_press_duration_min_spin.setValue(p.ghost_fire_press_duration_min)
+        self.ghost_fire_press_duration_max_spin.setValue(p.ghost_fire_press_duration_max)
+        self.ghost_fire_ad_interval_min_spin.setValue(p.ghost_fire_ad_interval_min)
+        self.ghost_fire_ad_interval_max_spin.setValue(p.ghost_fire_ad_interval_max)
+        self.ghost_fire_jump_interval_min_spin.setValue(p.ghost_fire_jump_interval_min)
+        self.ghost_fire_jump_interval_max_spin.setValue(p.ghost_fire_jump_interval_max)
         self.action_jump_checkbox.setChecked(p.action_jump)
         self.monthly_card_close_checkbox.setChecked(p.monthly_card_close_enabled)
         self.monthly_card_minute_spin.setValue(p.monthly_card_minute)
         self._on_random_cruise_changed(self.random_cruise_checkbox.checkState())
+        self._on_ghost_fire_mode_changed()
         self.monthly_card_minute_spin.setEnabled(self.monthly_card_close_checkbox.isChecked())
         self._update_task_type_ui()
         self._loading_profile = False
@@ -996,6 +1152,8 @@ class MainWindow(QMainWindow):
             p.task_type = TASK_TYPE_SMALL
         elif self.radio_host_action.isChecked():
             p.task_type = TASK_TYPE_HOST
+        elif self.radio_ghost_fire.isChecked():
+            p.task_type = TASK_TYPE_GHOST_FIRE
         else:
             p.task_type = TASK_TYPE_TIME_ADJUST
         p.action_key = self.action_key_combo.currentText()
@@ -1021,6 +1179,13 @@ class MainWindow(QMainWindow):
         p.cruise_probability = self.cruise_probability_spin.value()
         p.cruise_hold_min = self.cruise_hold_min_spin.value(); p.cruise_hold_max = self.cruise_hold_max_spin.value()
         p.cruise_space_min = self.cruise_space_min_spin.value(); p.cruise_space_max = self.cruise_space_max_spin.value()
+        p.ghost_fire_mode = self.ghost_fire_mode_combo.currentData() or "hold_w"
+        p.ghost_fire_press_duration_min = self.ghost_fire_press_duration_min_spin.value()
+        p.ghost_fire_press_duration_max = self.ghost_fire_press_duration_max_spin.value()
+        p.ghost_fire_ad_interval_min = self.ghost_fire_ad_interval_min_spin.value()
+        p.ghost_fire_ad_interval_max = self.ghost_fire_ad_interval_max_spin.value()
+        p.ghost_fire_jump_interval_min = self.ghost_fire_jump_interval_min_spin.value()
+        p.ghost_fire_jump_interval_max = self.ghost_fire_jump_interval_max_spin.value()
         p.action_jump = self.action_jump_checkbox.isChecked()
         p.monthly_card_close_enabled = self.monthly_card_close_checkbox.isChecked()
         p.monthly_card_minute = self.monthly_card_minute_spin.value()
