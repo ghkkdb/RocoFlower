@@ -9,7 +9,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 $ProjectRoot = $PSScriptRoot
-$OutputFileName = "RocoFlower.exe"
+$AppVersion = "2.5.5"
+$WindowsFileVersion = "$AppVersion.0"
+$OutputFileName = "RocoFlower$AppVersion.exe"
 $IconFile = "favicon.ico"
 $EntryPoint = "main_window.py"
 $CacheDir = Join-Path $ProjectRoot "nuitka_cache"
@@ -86,6 +88,9 @@ $nuitkaArgs = @(
     "--standalone",
     "--windows-console-mode=disable",
     "--windows-icon-from-ico=$IconFile",
+    "--product-name=RocoFlower",
+    "--file-version=$WindowsFileVersion",
+    "--product-version=$WindowsFileVersion",
     "--enable-plugin=pyqt5",
     "--assume-yes-for-downloads",
     "--lto=yes",
@@ -109,6 +114,9 @@ $nuitkaArgs = @(
     "--include-module=win32api",
     "--include-module=win32ui",
     "--include-data-dir=img=img",
+    "--include-data-dir=DD_master\2.hid=DD_master\2.hid",
+    "--include-data-files=DD_master\2.hid\drv\ddc.exe=DD_master\2.hid\drv\ddc.exe",
+    "--include-data-files=DD_master\2.hid\ddhid.63340.dll=DD_master\2.hid\ddhid.63340.dll",
     "--noinclude-dlls=qt5network_conda.dll",
     "--noinclude-dlls=qt5pdf_conda.dll",
     "--noinclude-dlls=qt5quick_conda.dll",

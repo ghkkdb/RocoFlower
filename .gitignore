@@ -1,5 +1,6 @@
 # Python
 __pycache__/
+.venv/
 .venv-slim/
 *.py[cod]
 *$py.class
@@ -39,6 +40,12 @@ license.key
 # 可执行文件
 *.exe
 *.dll
+!DD_master/2.hid/drv/ddc.exe
+!DD_master/2.hid/ddhid.63340.dll
+
+# Vendor/example source drops
+DD_master/App_python/
+buke_km_lib/
 
 # IDE
 .trae/

@@ -12,7 +12,9 @@ $ErrorActionPreference = "Stop"
 $ProjectRoot = $PSScriptRoot
 $EntryPoint = "main_window.py"
 $IconFile = "favicon.ico"
-$OutputFileName = "RocoFlower-slim.exe"
+$AppVersion = "2.5.5"
+$WindowsFileVersion = "$AppVersion.0"
+$OutputFileName = "RocoFlower$AppVersion.exe"
 $VenvDir = Join-Path $ProjectRoot ".venv-slim"
 $VenvPython = Join-Path $VenvDir "Scripts\python.exe"
 $CacheDir = Join-Path $ProjectRoot "nuitka_cache_slim"
@@ -116,6 +118,9 @@ $nuitkaArgs = @(
     "--onefile",
     "--windows-console-mode=disable",
     "--windows-icon-from-ico=$IconFile",
+    "--product-name=RocoFlower",
+    "--file-version=$WindowsFileVersion",
+    "--product-version=$WindowsFileVersion",
     "--enable-plugin=pyqt5",
     "--enable-plugin=upx",
     "--output-filename=$OutputFileName",
@@ -141,6 +146,9 @@ $nuitkaArgs = @(
     "--include-module=win32api",
     "--include-module=win32ui",
     "--include-data-dir=img=img",
+    "--include-data-dir=DD_master\2.hid=DD_master\2.hid",
+    "--include-data-files=DD_master\2.hid\drv\ddc.exe=DD_master\2.hid\drv\ddc.exe",
+    "--include-data-files=DD_master\2.hid\ddhid.63340.dll=DD_master\2.hid\ddhid.63340.dll",
     $EntryPoint
 )
 

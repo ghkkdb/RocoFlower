@@ -12,9 +12,11 @@ from tools import (
     background_key_down,
     background_key_up,
     click_mouse,
+    create_input_controller,
     deactivate_window,
     humanized_key_press,
     humanized_sleep,
+    INPUT_BACKEND_PYWIN32,
     match_template_in_window_foreground,
     long_press_key,
 )
@@ -33,6 +35,22 @@ def _emit_log(log_callback: Logger, message: str, color: Optional[str] = None) -
 
 def _wait_or_stop(stop_event: threading.Event, seconds: float) -> bool:
     return stop_event.wait(max(0.0, float(seconds)))
+
+
+def _key_press(controller, hwnd: int, key: str, **kwargs) -> bool:
+    if getattr(controller, "is_hid", False):
+        return controller.key_press(key, **kwargs)
+    return controller.key_press(hwnd, key, **kwargs)
+
+
+def _long_press(controller, hwnd: int, key: str, duration: float, **kwargs) -> bool:
+    if getattr(controller, "is_hid", False):
+        return controller.long_press(key, duration, **kwargs)
+    return controller.long_press(hwnd, key, duration, **kwargs)
+
+
+def _click(controller, hwnd: int, x: int, y: int, button: str = "left", **kwargs) -> bool:
+    return controller.click(hwnd, x, y, button, **kwargs)
 
 
 def _ensure_window_topmost(hwnd: int, log: Logger = None) -> bool:
@@ -104,12 +122,14 @@ def task_1(
     动作跳: bool = True,
     stop_event: threading.Event = None,
     log_callback: Logger = None,
+    input_controller=None,
 ):
     """
     主任务循环。
     """
     if stop_event is None:
         stop_event = threading.Event()
+    controller = input_controller or create_input_controller(INPUT_BACKEND_PYWIN32)
 
     def log(message: str, color: Optional[str] = None) -> None:
         _emit_log(log_callback, message, color)
@@ -117,7 +137,8 @@ def task_1(
     def press(key: str, enable_hesitation: bool = True, enable_rhythm: bool = True) -> bool:
         if stop_event.is_set():
             return False
-        return humanized_key_press(
+        return _key_press(
+            controller,
             hwnd,
             key,
             enable_hesitation=enable_hesitation,
@@ -152,14 +173,14 @@ def task_1(
         reverse_direction = {"W": "S", "S": "W", "A": "D", "D": "A"}[direction]
 
         log(f"  [随机巡航] 长按方向键 [{direction}] {hold_time:.2f}秒")
-        if not _long_press_key(hwnd, direction, hold_time, stop_event):
+        if not _long_press(controller, hwnd, direction, hold_time, enable_hesitation=False, stop_event=stop_event):
             return False
 
         if sleep_for(0.2, variation=0.2):
             return False
 
         log(f"  [随机巡航] 长按方向键 [{direction}] 完成，反向走回...")
-        if not _long_press_key(hwnd, reverse_direction, hold_time, stop_event):
+        if not _long_press(controller, hwnd, reverse_direction, hold_time, enable_hesitation=False, stop_event=stop_event):
             return False
 
         log(f"  [随机巡航] 长按方向键 [{reverse_direction}] 完成")
@@ -264,7 +285,16 @@ def task_1(
         if _wait_or_stop(stop_event, current_interval):
             break
         iteration += 1
-        if not runner(iteration, current_interval):
+        if getattr(controller, "is_hid", False):
+            ok = controller.run_for_window(
+                hwnd,
+                lambda: runner(iteration, current_interval),
+                stop_event=stop_event,
+                log=log,
+            )
+        else:
+            ok = runner(iteration, current_interval)
+        if not ok:
             break
 
 
@@ -279,9 +309,11 @@ def 时间调整(
     不退出改时间界面=False,
     log: Logger = None,
     stop_event: threading.Event = None,
+    input_controller=None,
 ):
     if stop_event is None:
         stop_event = threading.Event()
+    controller = input_controller or create_input_controller(INPUT_BACKEND_PYWIN32)
 
     def emit(message: str, color: Optional[str] = None) -> None:
         _emit_log(log, message, color)
@@ -290,7 +322,75 @@ def 时间调整(
         return humanized_sleep(seconds, variation=variation, stop_event=stop_event)
 
     def press(key: str) -> bool:
-        return humanized_key_press(hwnd, key, stop_event=stop_event)
+        return _key_press(controller, hwnd, key, stop_event=stop_event)
+
+    if getattr(controller, "is_hid", False):
+        if 置顶识别调整 or 使用识别释放精灵:
+            emit("HID 输入方式不开放图片识别流程，本次按固定步骤执行游戏时间调整", "green")
+        使用识别释放精灵 = False
+        置顶识别调整 = False
+
+        def hid_time_adjust_action() -> bool:
+            emit("HID 前台模式：开始执行固定步骤游戏时间调整")
+            if 防果冻 and not press("X"):
+                return False
+            if sleep_for(0.5, variation=0.15):
+                return False
+            emit("触发传送石")
+            if not press("F"):
+                return False
+            if sleep_for(10, variation=0.15):
+                return False
+            emit("选择调整时间")
+            if not press("1"):
+                return False
+            if sleep_for(3, variation=0.15):
+                return False
+            emit("开启/关闭自动播放")
+            if not press("Tab"):
+                return False
+            if sleep_for(5, variation=0.15):
+                return False
+            emit("选择早上")
+            if not press("1"):
+                return False
+            if sleep_for(10, variation=0.15):
+                return False
+            if 不退出改时间界面:
+                _time_adjust_keep_open_hwnds.add(hwnd)
+                emit("按配置不退出改时间界面")
+            else:
+                if not press("2"):
+                    return False
+                emit("退出")
+                _time_adjust_keep_open_hwnds.discard(hwnd)
+                if sleep_for(5, variation=0.15):
+                    return False
+            if 释放精灵:
+                emit("非识别释放精灵流程开始", color="green")
+                for i in range(1, 7):
+                    if i == 同乘精灵:
+                        emit(f"跳过{i}号骑乘精灵")
+                        if sleep_for(1, variation=0.15):
+                            return False
+                        continue
+                    if 防果冻 and not press("X"):
+                        return False
+                    if sleep_for(2, variation=0.15):
+                        return False
+                    emit(f"执行非识别释放 {i}号精灵")
+                    if not press(str(i)):
+                        return False
+                    if sleep_for(2, variation=0.15):
+                        return False
+                    if not _click(controller, hwnd, 0, 0, "left", stop_event=stop_event):
+                        return False
+                emit("非识别释放精灵流程完成", color="green")
+            emit("游戏时间调整流程执行完成")
+            return not stop_event.is_set()
+
+        controller.run_for_window(hwnd, hid_time_adjust_action, stop_event=stop_event, log=emit)
+        return
 
     if 不退出改时间界面 and 释放精灵:
         释放精灵 = False
@@ -513,12 +613,14 @@ def 月卡关闭(
     target_minute=1,
     stop_event: threading.Event = None,
     log: Logger = None,
+    input_controller=None,
 ):
     """
     每天在 04:01-04:05 的指定时间执行一次月卡关闭点击。
     """
     if stop_event is None:
         stop_event = threading.Event()
+    controller = input_controller or create_input_controller(INPUT_BACKEND_PYWIN32)
 
     if target_minute < 1 or target_minute > 5:
         raise ValueError("月卡关闭时间仅支持 04:01-04:05，请传入 1-5 的分钟值")
@@ -536,11 +638,17 @@ def 月卡关闭(
         if now.hour == 4 and now.minute == target_minute and last_trigger_date != now.date():
             try:
                 emit(f"到达月卡关闭时间 04:{target_minute:02d}，开始执行前台点击", color="green")
-                activate_window(hwnd)
-                if humanized_sleep(0.2, variation=0.1, stop_event=stop_event):
-                    return
-                click_mouse(hwnd, 0, 0, "left", stop_event=stop_event)
-                deactivate_window(hwnd)
+                def close_action() -> bool:
+                    if not getattr(controller, "is_hid", False):
+                        activate_window(hwnd)
+                    if humanized_sleep(0.2, variation=0.1, stop_event=stop_event):
+                        return False
+                    _click(controller, hwnd, 0, 0, "left", stop_event=stop_event)
+                    if not getattr(controller, "is_hid", False):
+                        deactivate_window(hwnd)
+                    return True
+
+                controller.run_for_window(hwnd, close_action, stop_event=stop_event, log=emit)
                 emit("月卡关闭点击完成", color="green")
             except Exception as exc:
                 emit(f"月卡关闭执行失败: {exc}", color="red")

@@ -2,7 +2,12 @@ import random
 import threading
 from typing import Callable, Optional
 
-from tools import background_key_down, background_key_up, humanized_key_press, long_press_key
+from tools import (
+    background_key_down,
+    background_key_up,
+    create_input_controller,
+    INPUT_BACKEND_PYWIN32,
+)
 
 
 Logger = Optional[Callable[[str, Optional[str]], None]]
@@ -30,9 +35,11 @@ def 刷鬼火(
     jump_interval_max: float = 8.0,
     stop_event: threading.Event = None,
     log: Logger = None,
+    input_controller=None,
 ):
     if stop_event is None:
         stop_event = threading.Event()
+    controller = input_controller or create_input_controller(INPUT_BACKEND_PYWIN32)
 
     mode = str(mode or "hold_w").lower()
     ad_interval_min = max(0.05, float(ad_interval_min))
@@ -51,7 +58,20 @@ def 刷鬼火(
     def sample_range(min_value: float, max_value: float) -> float:
         return random.uniform(min_value, max_value)
 
+    def press_key(key: str, **kwargs) -> bool:
+        if getattr(controller, "is_hid", False):
+            return controller.key_press(key, **kwargs)
+        return controller.key_press(hwnd, key, **kwargs)
+
+    def press_long(key: str, duration: float, **kwargs) -> bool:
+        if getattr(controller, "is_hid", False):
+            return controller.long_press(key, duration, **kwargs)
+        return controller.long_press(hwnd, key, duration, **kwargs)
+
     if mode == "hold_w":
+        if getattr(controller, "is_hid", False):
+            _emit_log(log, "HID 输入方式不支持刷鬼火长按 W，请改用循环短按 A/D 或跳跃模式", "red")
+            return
         _emit_log(log, "开始执行刷鬼火，模式: 长按 [W]", "green")
         pressed = False
         try:
@@ -79,28 +99,21 @@ def 刷鬼火(
             first_wait_duration = sample_range(ad_interval_min, ad_interval_max)
             second_wait_duration = sample_range(ad_interval_min, ad_interval_max)
 
-            if not long_press_key(
-                hwnd,
-                "A",
-                pair_press_duration,
-                enable_hesitation=False,
-                stop_event=stop_event,
-            ):
-                if not stop_event.is_set():
-                    _emit_log(log, "刷鬼火执行失败，短按 [A] 未成功完成", "red")
-                break
-            if _wait_or_stop(stop_event, first_wait_duration):
-                break
+            def ad_pair_action() -> bool:
+                if not press_long("A", pair_press_duration, enable_hesitation=False, stop_event=stop_event):
+                    return False
+                if _wait_or_stop(stop_event, first_wait_duration):
+                    return False
+                return press_long("D", pair_press_duration, enable_hesitation=False, stop_event=stop_event)
 
-            if not long_press_key(
-                hwnd,
-                "D",
-                pair_press_duration,
-                enable_hesitation=False,
-                stop_event=stop_event,
-            ):
+            if getattr(controller, "is_hid", False):
+                pair_ok = controller.run_for_window(hwnd, ad_pair_action, stop_event=stop_event, log=log)
+            else:
+                pair_ok = ad_pair_action()
+
+            if not pair_ok:
                 if not stop_event.is_set():
-                    _emit_log(log, "刷鬼火执行失败，短按 [D] 未成功完成", "red")
+                    _emit_log(log, "刷鬼火执行失败，A/D 成对短按未完成", "red")
                 break
             if _wait_or_stop(stop_event, second_wait_duration):
                 break
@@ -115,13 +128,20 @@ def 刷鬼火(
             "green",
         )
         while not stop_event.is_set():
-            if not humanized_key_press(
-                hwnd,
-                "Space",
-                enable_hesitation=False,
-                enable_rhythm=False,
-                stop_event=stop_event,
-            ):
+            def jump_action() -> bool:
+                return press_key(
+                    "Space",
+                    enable_hesitation=False,
+                    enable_rhythm=False,
+                    stop_event=stop_event,
+                )
+
+            if getattr(controller, "is_hid", False):
+                jump_ok = controller.run_for_window(hwnd, jump_action, stop_event=stop_event, log=log)
+            else:
+                jump_ok = jump_action()
+
+            if not jump_ok:
                 if not stop_event.is_set():
                     _emit_log(log, "刷鬼火执行失败，跳跃 [Space] 未成功完成", "red")
                 break

@@ -28,6 +28,17 @@ from auth import check_license
 from drag_window_picker import DragWindowPicker
 from ghost_fire import 刷鬼火
 from task import task_1, 月卡关闭, 时间调整
+from tools import (
+    BukeKmHidError,
+    check_buke_hid_initialization,
+    configure_hid_foreground_scheduler,
+    create_input_controller,
+    HID_SWITCH_CHECK_FOREGROUND,
+    HID_SWITCH_CHECK_NONE,
+    INPUT_BACKEND_BUKE_HID,
+    INPUT_BACKEND_PYWIN32,
+    run_buke_hid_driver_installer,
+)
 
 MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
@@ -35,7 +46,7 @@ MOD_SHIFT = 0x0004
 MOD_WIN = 0x0008
 HOTKEY_ID_START = 0x5001
 HOTKEY_ID_STOP = 0x5002
-APP_VERSION = "2.5.4"
+APP_VERSION = "2.5.5"
 APP_TITLE = f"RocoFlower V{APP_VERSION}【咸鱼：KKDB】"
 TASK_TYPE_SMALL = "小号做动作"
 TASK_TYPE_HOST = "房主同乘做动作"
@@ -283,6 +294,8 @@ class MainWindow(QMainWindow):
         self._legacy_default = WindowProfile()
         self._start_hotkey_seq = QKeySequence("Ctrl+Alt+S")
         self._stop_hotkey_seq = QKeySequence("Ctrl+Alt+X")
+        self._input_backend = INPUT_BACKEND_BUKE_HID
+        self._hid_switch_check = HID_SWITCH_CHECK_NONE
 
         self._init_ui()
         self._connect_signals()
@@ -390,21 +403,55 @@ class MainWindow(QMainWindow):
         v.addLayout(task_type_row)
 
         self.global_config_group = QGroupBox("全局配置")
-        global_layout = QHBoxLayout(self.global_config_group)
-        global_layout.addWidget(QLabel("运行时长(分钟):"))
+        global_layout = QVBoxLayout(self.global_config_group)
+
+        input_row = QHBoxLayout()
+        input_row.addWidget(QLabel("输入方式:"))
+        self.input_backend_combo = QComboBox()
+        self.input_backend_combo.addItem("DD HID 前台模拟", INPUT_BACKEND_BUKE_HID)
+        self.input_backend_combo.addItem("pywin32 后台模拟", INPUT_BACKEND_PYWIN32)
+        self.input_backend_combo.setMaximumWidth(180)
+        input_row.addWidget(self.input_backend_combo)
+        input_row.addSpacing(12)
+        input_row.addWidget(QLabel("HID切换校验:"))
+        self.hid_switch_check_combo = QComboBox()
+        self.hid_switch_check_combo.addItem("完全不检测", HID_SWITCH_CHECK_NONE)
+        self.hid_switch_check_combo.addItem("读取前台窗口校验", HID_SWITCH_CHECK_FOREGROUND)
+        self.hid_switch_check_combo.setMaximumWidth(160)
+        input_row.addWidget(self.hid_switch_check_combo)
+        input_row.addSpacing(12)
+        self.hid_install_btn = QPushButton("安装DD驱动")
+        self.hid_uninstall_btn = QPushButton("卸载DD驱动")
+        self.hid_check_btn = QPushButton("初始化检测")
+        input_row.addWidget(self.hid_install_btn)
+        input_row.addWidget(self.hid_uninstall_btn)
+        input_row.addWidget(self.hid_check_btn)
+        input_row.addStretch()
+        global_layout.addLayout(input_row)
+
+        status_row = QHBoxLayout()
+        self.hid_driver_status_label = QLabel("DD驱动状态：未检测")
+        self.hid_driver_status_label.setWordWrap(True)
+        self.hid_driver_status_label.setStyleSheet("color: #666;")
+        status_row.addWidget(self.hid_driver_status_label)
+        global_layout.addLayout(status_row)
+
+        runtime_row = QHBoxLayout()
+        runtime_row.addWidget(QLabel("运行时长(分钟):"))
         self.duration_spin = QSpinBox(); self.duration_spin.setRange(1, 60000)
-        global_layout.addWidget(self.duration_spin)
+        runtime_row.addWidget(self.duration_spin)
         self.auto_shutdown_checkbox = QCheckBox("任务完成后自动关机")
-        global_layout.addSpacing(20)
-        global_layout.addWidget(self.auto_shutdown_checkbox)
-        global_layout.addSpacing(20)
+        runtime_row.addSpacing(20)
+        runtime_row.addWidget(self.auto_shutdown_checkbox)
+        runtime_row.addSpacing(20)
         self.monthly_card_close_checkbox = QCheckBox("启用月卡关闭")
         self.monthly_card_minute_spin = QSpinBox(); self.monthly_card_minute_spin.setRange(1, 5); self.monthly_card_minute_spin.setPrefix("0")
-        global_layout.addWidget(self.monthly_card_close_checkbox)
-        global_layout.addWidget(QLabel("执行时间: 04:"))
-        global_layout.addWidget(self.monthly_card_minute_spin)
-        global_layout.addWidget(QLabel("(仅支持 04:01-04:05)"))
-        global_layout.addStretch()
+        runtime_row.addWidget(self.monthly_card_close_checkbox)
+        runtime_row.addWidget(QLabel("执行时间: 04:"))
+        runtime_row.addWidget(self.monthly_card_minute_spin)
+        runtime_row.addWidget(QLabel("(仅支持 04:01-04:05)"))
+        runtime_row.addStretch()
+        global_layout.addLayout(runtime_row)
         v.addWidget(self.global_config_group)
 
         self.action_task_group = QGroupBox("动作任务配置")
@@ -569,6 +616,8 @@ class MainWindow(QMainWindow):
         self.time_adjust_anti_jelly_checkbox.setChecked(False)
         self.time_adjust_topmost_recognition_checkbox.setChecked(False)
         self.time_adjust_exit_interface_checkbox.setChecked(True)
+        self.input_backend_combo.setCurrentIndex(0)
+        self.hid_switch_check_combo.setCurrentIndex(0)
         self.ghost_fire_mode_combo.setCurrentIndex(0)
         self.ghost_fire_press_duration_min_spin.setValue(0.3)
         self.ghost_fire_press_duration_max_spin.setValue(0.5)
@@ -631,6 +680,11 @@ class MainWindow(QMainWindow):
         self.time_adjust_use_release_pet_recognition_checkbox.stateChanged.connect(self._on_time_adjust_release_pet_recognition_changed)
         self.time_adjust_exit_interface_checkbox.stateChanged.connect(self._on_time_adjust_exit_interface_changed)
         self.monthly_card_close_checkbox.stateChanged.connect(lambda s: self.monthly_card_minute_spin.setEnabled(s == Qt.Checked))
+        self.input_backend_combo.currentIndexChanged.connect(self._on_input_backend_changed)
+        self.hid_switch_check_combo.currentIndexChanged.connect(self._on_input_backend_changed)
+        self.hid_install_btn.clicked.connect(self._on_install_hid_driver)
+        self.hid_uninstall_btn.clicked.connect(self._on_uninstall_hid_driver)
+        self.hid_check_btn.clicked.connect(self._on_check_hid_init)
         self.radio_small_account.toggled.connect(self._on_task_type_changed)
         self.radio_host_action.toggled.connect(self._on_task_type_changed)
         self.radio_time_adjust.toggled.connect(self._on_task_type_changed)
@@ -673,6 +727,26 @@ class MainWindow(QMainWindow):
             return
         self._save_ui_to_profile()
 
+    def _enforce_hid_ui_limits(self) -> None:
+        if not self._is_hid_input_selected():
+            return
+        changed = False
+        for checkbox in (
+            self.time_adjust_use_release_pet_recognition_checkbox,
+            self.time_adjust_topmost_recognition_checkbox,
+        ):
+            if checkbox.isChecked():
+                checkbox.blockSignals(True)
+                checkbox.setChecked(False)
+                checkbox.blockSignals(False)
+                changed = True
+            checkbox.setEnabled(False)
+        self.time_adjust_release_pet_checkbox.setEnabled(
+            self._is_time_adjust_selected() and not self._is_time_adjust_keep_open_selected()
+        )
+        if changed:
+            self._on_profile_changed()
+
     def _on_random_cruise_changed(self, state):
         e = state == Qt.Checked
         self.cruise_probability_spin.setEnabled(e)
@@ -683,6 +757,12 @@ class MainWindow(QMainWindow):
         self._on_profile_changed()
 
     def _on_time_adjust_release_pet_changed(self, state):
+        if self._is_hid_input_selected():
+            if state == Qt.Checked and not self.time_adjust_exit_interface_checkbox.isChecked():
+                self.time_adjust_exit_interface_checkbox.setChecked(True)
+            self._enforce_hid_ui_limits()
+            self._on_profile_changed()
+            return
         if state == Qt.Checked and not self.time_adjust_exit_interface_checkbox.isChecked():
             self.time_adjust_exit_interface_checkbox.setChecked(True)
         if state == Qt.Checked and self.time_adjust_use_release_pet_recognition_checkbox.isChecked():
@@ -693,6 +773,9 @@ class MainWindow(QMainWindow):
         self._on_profile_changed()
 
     def _on_time_adjust_release_pet_recognition_changed(self, state):
+        if self._is_hid_input_selected():
+            self._enforce_hid_ui_limits()
+            return
         if state == Qt.Checked:
             if self.time_adjust_release_pet_checkbox.isChecked():
                 self.time_adjust_release_pet_checkbox.setChecked(False)
@@ -704,6 +787,12 @@ class MainWindow(QMainWindow):
 
     def _on_time_adjust_exit_interface_changed(self, state):
         keep_open = state != Qt.Checked
+        if self._is_hid_input_selected():
+            self._enforce_hid_ui_limits()
+            self.time_adjust_release_pet_checkbox.setEnabled(self._is_time_adjust_selected() and not keep_open)
+            self.time_adjust_anti_jelly_checkbox.setEnabled(self._is_time_adjust_selected() and not keep_open)
+            self._on_profile_changed()
+            return
         if keep_open and self.time_adjust_release_pet_checkbox.isChecked():
             self.time_adjust_release_pet_checkbox.setChecked(False)
         if keep_open and self.time_adjust_use_release_pet_recognition_checkbox.isChecked():
@@ -753,10 +842,69 @@ class MainWindow(QMainWindow):
     def _is_host_action_selected(self) -> bool:
         return self.radio_host_action.isChecked()
 
+    def _is_hid_input_selected(self) -> bool:
+        return (self.input_backend_combo.currentData() or INPUT_BACKEND_BUKE_HID) == INPUT_BACKEND_BUKE_HID
+
+    def _on_input_backend_changed(self, *_):
+        self._input_backend = self.input_backend_combo.currentData() or INPUT_BACKEND_BUKE_HID
+        self._hid_switch_check = self.hid_switch_check_combo.currentData() or HID_SWITCH_CHECK_NONE
+        self.hid_switch_check_combo.setEnabled(self._input_backend == INPUT_BACKEND_BUKE_HID)
+        self.hid_install_btn.setEnabled(self._input_backend == INPUT_BACKEND_BUKE_HID)
+        self.hid_uninstall_btn.setEnabled(self._input_backend == INPUT_BACKEND_BUKE_HID)
+        self.hid_check_btn.setEnabled(self._input_backend == INPUT_BACKEND_BUKE_HID)
+        if self._input_backend == INPUT_BACKEND_BUKE_HID:
+            self._enforce_hid_ui_limits()
+            if self.ghost_fire_mode_combo.currentData() == "hold_w":
+                ad_loop_index = self.ghost_fire_mode_combo.findData("ad_loop")
+                if ad_loop_index >= 0:
+                    self.ghost_fire_mode_combo.setCurrentIndex(ad_loop_index)
+        self._update_task_type_ui()
+        self._on_profile_changed()
+        self.save_config()
+
+    def _set_hid_driver_status(self, message: str, color: str = "#666") -> None:
+        self.hid_driver_status_label.setText(f"DD驱动状态：{message}")
+        self.hid_driver_status_label.setStyleSheet(f"color: {color};")
+
+    def _on_install_hid_driver(self):
+        try:
+            if run_buke_hid_driver_installer(True):
+                self._set_hid_driver_status("已拉起管理员安装窗口，请按提示完成安装，完成后建议重启或重新检测", "green")
+                self.append_log("已请求管理员权限安装 DD 驱动")
+            else:
+                self._set_hid_driver_status("安装请求未成功发起，可能被系统或权限策略拦截", "red")
+        except Exception as exc:
+            self._set_hid_driver_status(f"安装失败: {exc}", "red")
+            self.append_log(f"DD 驱动安装失败: {exc}", "red")
+
+    def _on_uninstall_hid_driver(self):
+        try:
+            if run_buke_hid_driver_installer(False):
+                self._set_hid_driver_status("已拉起管理员卸载窗口，请按提示完成卸载，完成后建议重启", "green")
+                self.append_log("已请求管理员权限卸载 DD 驱动")
+            else:
+                self._set_hid_driver_status("卸载请求未成功发起，可能被系统或权限策略拦截", "red")
+        except Exception as exc:
+            self._set_hid_driver_status(f"卸载失败: {exc}", "red")
+            self.append_log(f"DD 驱动卸载失败: {exc}", "red")
+
+    def _on_check_hid_init(self):
+        ok, driver_installed, message = check_buke_hid_initialization()
+        if ok:
+            self._set_hid_driver_status("驱动可用，初始化成功", "green")
+            self.append_log(message, "green")
+        elif driver_installed:
+            self._set_hid_driver_status(message, "red")
+            self.append_log(message, "red")
+        else:
+            self._set_hid_driver_status(message, "red")
+            self.append_log(message, "red")
+
     def _update_task_type_ui(self):
         is_time_adjust = self._is_time_adjust_selected()
         is_host_action = self._is_host_action_selected()
         is_ghost_fire = self.radio_ghost_fire.isChecked()
+        is_hid = self._is_hid_input_selected()
         is_action_task = not is_time_adjust and not is_ghost_fire
         self.action_task_group.setEnabled(is_action_task)
         self.ghost_fire_group.setEnabled(is_ghost_fire)
@@ -777,13 +925,29 @@ class MainWindow(QMainWindow):
         self.ghost_fire_ad_interval_max_spin.setEnabled(ad_loop_enabled)
         self.ghost_fire_jump_interval_min_spin.setEnabled(jump_mode_enabled)
         self.ghost_fire_jump_interval_max_spin.setEnabled(jump_mode_enabled)
-        self.time_adjust_release_pet_checkbox.setEnabled(is_time_adjust and not self._is_time_adjust_keep_open_selected())
+        self.time_adjust_release_pet_checkbox.setEnabled(is_time_adjust and not is_hid and not self._is_time_adjust_keep_open_selected())
         self.time_adjust_use_release_pet_recognition_checkbox.setEnabled(
-            is_time_adjust and not self._is_time_adjust_keep_open_selected()
+            is_time_adjust and not is_hid and not self._is_time_adjust_keep_open_selected()
         )
         self.time_adjust_anti_jelly_checkbox.setEnabled(is_time_adjust and not self._is_time_adjust_keep_open_selected())
-        self.time_adjust_topmost_recognition_checkbox.setEnabled(is_time_adjust)
+        self.time_adjust_topmost_recognition_checkbox.setEnabled(is_time_adjust and not is_hid)
         self.time_adjust_exit_interface_checkbox.setEnabled(is_time_adjust)
+        self.hid_switch_check_combo.setEnabled(is_hid)
+        self.hid_install_btn.setEnabled(is_hid)
+        self.hid_uninstall_btn.setEnabled(is_hid)
+        self.hid_check_btn.setEnabled(is_hid)
+        hold_w_index = self.ghost_fire_mode_combo.findData("hold_w")
+        if hold_w_index >= 0:
+            model = self.ghost_fire_mode_combo.model()
+            item = model.item(hold_w_index)
+            if item is not None:
+                item.setEnabled(not is_hid)
+        if is_hid and is_ghost_fire and self.ghost_fire_mode_combo.currentData() == "hold_w":
+            ad_loop_index = self.ghost_fire_mode_combo.findData("ad_loop")
+            if ad_loop_index >= 0:
+                self.ghost_fire_mode_combo.setCurrentIndex(ad_loop_index)
+        if is_hid:
+            self._enforce_hid_ui_limits()
 
     def _on_task_type_changed(self, *_):
         if not self._loading_profile and self._is_host_action_selected() and self.anti_jelly_checkbox.isChecked():
@@ -912,6 +1076,10 @@ class MainWindow(QMainWindow):
             return
         p.normalize()
         stop_event = threading.Event()
+        input_backend = self.input_backend_combo.currentData() or INPUT_BACKEND_BUKE_HID
+        hid_switch_check = self.hid_switch_check_combo.currentData() or HID_SWITCH_CHECK_NONE
+        if input_backend == INPUT_BACKEND_BUKE_HID:
+            configure_hid_foreground_scheduler(list(self._profiles.keys()), hid_switch_check)
 
         def log_cb(msg, color=None):
             s = f"[{self._window_tag(hwnd)}] {msg}"
@@ -952,9 +1120,13 @@ class MainWindow(QMainWindow):
 
         def task_worker():
             try:
+                input_controller = create_input_controller(input_backend)
+                if input_backend == INPUT_BACKEND_BUKE_HID:
+                    log_cb("使用 HID 前台模拟，任务将进入全局前台队列")
                 if p.task_type == TASK_TYPE_TIME_ADJUST:
                     while not stop_event.is_set():
-                        apply_time_adjust_resolution()
+                        if input_backend != INPUT_BACKEND_BUKE_HID:
+                            apply_time_adjust_resolution()
                         log_cb("开始执行游戏时间调整")
                         时间调整(
                             hwnd,
@@ -967,8 +1139,10 @@ class MainWindow(QMainWindow):
                             p.time_adjust_keep_open,
                             log=log_cb,
                             stop_event=stop_event,
+                            input_controller=input_controller,
                         )
-                        clear_time_adjust_topmost()
+                        if input_backend != INPUT_BACKEND_BUKE_HID:
+                            clear_time_adjust_topmost()
                         next_interval_minutes = random.uniform(p.time_adjust_interval_min, p.time_adjust_interval_max)
                         next_interval_seconds = max(1, int(round(next_interval_minutes * 60)))
                         log_cb(f"下一次游戏时间调整将在 {next_interval_seconds // 60}分{next_interval_seconds % 60:02d}秒后执行")
@@ -986,6 +1160,7 @@ class MainWindow(QMainWindow):
                         jump_interval_max=p.ghost_fire_jump_interval_max,
                         stop_event=stop_event,
                         log=log_cb,
+                        input_controller=input_controller,
                     )
                 else:
                     task_1(
@@ -993,7 +1168,10 @@ class MainWindow(QMainWindow):
                         1, p.anti_jelly, p.random_cruise, p.cruise_probability, p.cruise_hold_min,
                         p.cruise_hold_max, p.cruise_space_min, p.cruise_space_max,
                         p.action_jump, stop_event=stop_event, log_callback=log_cb,
+                        input_controller=input_controller,
                     )
+            except BukeKmHidError as e:
+                log_cb(f"HID 初始化失败，任务已停止: {e}", "red")
             except Exception as e:
                 log_cb(f"任务执行异常: {e}", "red")
             finally:
@@ -1001,7 +1179,16 @@ class MainWindow(QMainWindow):
 
         def monthly_worker():
             try:
-                月卡关闭(hwnd, target_minute=p.monthly_card_minute, stop_event=stop_event, log=log_cb)
+                input_controller = create_input_controller(input_backend)
+                月卡关闭(
+                    hwnd,
+                    target_minute=p.monthly_card_minute,
+                    stop_event=stop_event,
+                    log=log_cb,
+                    input_controller=input_controller,
+                )
+            except BukeKmHidError as e:
+                log_cb(f"月卡线程 HID 初始化失败: {e}", "red")
             except Exception as e:
                 log_cb(f"月卡线程异常: {e}", "red")
 
@@ -1112,6 +1299,9 @@ class MainWindow(QMainWindow):
         self.time_adjust_anti_jelly_checkbox.setChecked(p.time_adjust_anti_jelly)
         self.time_adjust_topmost_recognition_checkbox.setChecked(p.time_adjust_topmost_recognition)
         self.time_adjust_exit_interface_checkbox.setChecked(not p.time_adjust_keep_open)
+        if self._is_hid_input_selected():
+            self.time_adjust_use_release_pet_recognition_checkbox.setChecked(False)
+            self.time_adjust_topmost_recognition_checkbox.setChecked(False)
         if (
             self.time_adjust_use_release_pet_recognition_checkbox.isChecked()
             and not self.time_adjust_topmost_recognition_checkbox.isChecked()
@@ -1128,6 +1318,10 @@ class MainWindow(QMainWindow):
         self.cruise_space_min_spin.setValue(p.cruise_space_min); self.cruise_space_max_spin.setValue(p.cruise_space_max)
         ghost_fire_mode_index = self.ghost_fire_mode_combo.findData(p.ghost_fire_mode)
         self.ghost_fire_mode_combo.setCurrentIndex(ghost_fire_mode_index if ghost_fire_mode_index >= 0 else 0)
+        if self._is_hid_input_selected() and self.ghost_fire_mode_combo.currentData() == "hold_w":
+            ad_loop_index = self.ghost_fire_mode_combo.findData("ad_loop")
+            if ad_loop_index >= 0:
+                self.ghost_fire_mode_combo.setCurrentIndex(ad_loop_index)
         self.ghost_fire_press_duration_min_spin.setValue(p.ghost_fire_press_duration_min)
         self.ghost_fire_press_duration_max_spin.setValue(p.ghost_fire_press_duration_max)
         self.ghost_fire_ad_interval_min_spin.setValue(p.ghost_fire_ad_interval_min)
@@ -1170,6 +1364,9 @@ class MainWindow(QMainWindow):
             self.time_adjust_topmost_recognition_checkbox.isChecked()
             or p.time_adjust_use_release_pet_recognition
         )
+        if self._is_hid_input_selected():
+            p.time_adjust_use_release_pet_recognition = False
+            p.time_adjust_topmost_recognition = False
         p.auto_shutdown = self.auto_shutdown_checkbox.isChecked()
         p.window_width = self.window_width_spin.value(); p.window_height = self.window_height_spin.value()
         p.window_x = self.window_x_spin.value(); p.window_y = self.window_y_spin.value()
@@ -1180,6 +1377,8 @@ class MainWindow(QMainWindow):
         p.cruise_hold_min = self.cruise_hold_min_spin.value(); p.cruise_hold_max = self.cruise_hold_max_spin.value()
         p.cruise_space_min = self.cruise_space_min_spin.value(); p.cruise_space_max = self.cruise_space_max_spin.value()
         p.ghost_fire_mode = self.ghost_fire_mode_combo.currentData() or "hold_w"
+        if self._is_hid_input_selected() and p.ghost_fire_mode == "hold_w":
+            p.ghost_fire_mode = "ad_loop"
         p.ghost_fire_press_duration_min = self.ghost_fire_press_duration_min_spin.value()
         p.ghost_fire_press_duration_max = self.ghost_fire_press_duration_max_spin.value()
         p.ghost_fire_ad_interval_min = self.ghost_fire_ad_interval_min_spin.value()
@@ -1310,6 +1509,8 @@ class MainWindow(QMainWindow):
                 "start": self._start_hotkey_seq.toString(QKeySequence.PortableText),
                 "stop": self._stop_hotkey_seq.toString(QKeySequence.PortableText),
             },
+            "input_backend": self.input_backend_combo.currentData() or INPUT_BACKEND_BUKE_HID,
+            "hid_switch_check": self.hid_switch_check_combo.currentData() or HID_SWITCH_CHECK_NONE,
             "window_profiles": {str(hwnd): prof.to_dict() for hwnd, prof in self._profiles.items()},
         }
         with open(p, "w", encoding="utf-8") as f:
@@ -1326,6 +1527,18 @@ class MainWindow(QMainWindow):
             self.append_log(f"读取配置失败: {e}", "red")
             return
         if isinstance(d, dict) and "window_profiles" in d:
+            input_backend = d.get("input_backend", INPUT_BACKEND_BUKE_HID)
+            input_index = self.input_backend_combo.findData(input_backend)
+            self.input_backend_combo.blockSignals(True)
+            self.input_backend_combo.setCurrentIndex(input_index if input_index >= 0 else 0)
+            self.input_backend_combo.blockSignals(False)
+            hid_switch_check = d.get("hid_switch_check", HID_SWITCH_CHECK_NONE)
+            check_index = self.hid_switch_check_combo.findData(hid_switch_check)
+            self.hid_switch_check_combo.blockSignals(True)
+            self.hid_switch_check_combo.setCurrentIndex(check_index if check_index >= 0 else 0)
+            self.hid_switch_check_combo.blockSignals(False)
+            self._input_backend = self.input_backend_combo.currentData() or INPUT_BACKEND_BUKE_HID
+            self._hid_switch_check = self.hid_switch_check_combo.currentData() or HID_SWITCH_CHECK_NONE
             hk = d.get("hotkeys", {})
             s = hk.get("start", "")
             t = hk.get("stop", "")
@@ -1347,6 +1560,7 @@ class MainWindow(QMainWindow):
             self._legacy_default = WindowProfile.from_dict(d if isinstance(d, dict) else {})
         if self.bound_windows_list.count() > 0:
             self.bound_windows_list.setCurrentRow(0)
+        self._update_task_type_ui()
 
     def closeEvent(self, event):
         for hwnd in list(self._sessions.keys()):

@@ -16,7 +16,7 @@ import sys
 import time
 from pathlib import Path
 import threading
-from typing import Dict, Optional, Tuple, Union
+from typing import Callable, Dict, Optional, Tuple, Union
 
 
 def get_app_dir() -> Path:
@@ -1192,6 +1192,373 @@ def click_mouse(
     interrupted = _interruptible_wait(hold_time, stop_event)
     win32api.mouse_event(up_event, 0, 0, 0, 0)
     return not interrupted
+
+
+INPUT_BACKEND_PYWIN32 = "pywin32"
+INPUT_BACKEND_BUKE_HID = "buke_hid"
+HID_SWITCH_CHECK_NONE = "none"
+HID_SWITCH_CHECK_FOREGROUND = "foreground"
+BUKE_HID_DRIVER_SERVICE_NAME = "ddhid63340"
+
+
+class BukeKmHidError(RuntimeError):
+    pass
+
+
+def get_buke_hid_driver_dir() -> Path:
+    return resolve_resource_path(Path("DD_master") / "2.hid" / "drv")
+
+
+def is_buke_hid_driver_installed() -> bool:
+    advapi32 = ctypes.windll.advapi32
+    advapi32.OpenSCManagerW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
+    advapi32.OpenSCManagerW.restype = ctypes.c_void_p
+    advapi32.OpenServiceW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint32]
+    advapi32.OpenServiceW.restype = ctypes.c_void_p
+    advapi32.CloseServiceHandle.argtypes = [ctypes.c_void_p]
+    advapi32.CloseServiceHandle.restype = ctypes.c_int
+    scm = advapi32.OpenSCManagerW(None, None, 0x0001)
+    if not scm:
+        return False
+    try:
+        service = advapi32.OpenServiceW(scm, BUKE_HID_DRIVER_SERVICE_NAME, 0x0001)
+        if not service:
+            return False
+        advapi32.CloseServiceHandle(service)
+        return True
+    finally:
+        advapi32.CloseServiceHandle(scm)
+
+
+def run_buke_hid_driver_installer(install: bool = True) -> bool:
+    driver_dir = get_buke_hid_driver_dir()
+    bat_name = "install.bat" if install else "uninstall.bat"
+    bat_path = driver_dir / bat_name
+    if not bat_path.exists():
+        raise BukeKmHidError("未找到 HID 驱动脚本，请确认驱动目录完整")
+    shell32 = ctypes.windll.shell32
+    shell32.ShellExecuteW.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_wchar_p,
+        ctypes.c_wchar_p,
+        ctypes.c_wchar_p,
+        ctypes.c_wchar_p,
+        ctypes.c_int,
+    ]
+    shell32.ShellExecuteW.restype = ctypes.c_void_p
+    result = shell32.ShellExecuteW(
+        None,
+        "runas",
+        str(bat_path),
+        None,
+        str(driver_dir),
+        1,
+    )
+    return int(result or 0) > 32
+
+
+class BukeKmHidDevice:
+    _instance = None
+    _lock = threading.Lock()
+
+    def __init__(self):
+        self._dll = None
+        self._load()
+
+    @classmethod
+    def get(cls) -> "BukeKmHidDevice":
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = cls()
+            return cls._instance
+
+    @classmethod
+    def reset(cls) -> None:
+        with cls._lock:
+            cls._instance = None
+
+    def _load(self) -> None:
+        dll_path = resolve_resource_path(Path("DD_master") / "2.hid" / "ddhid.63340.dll")
+        if not dll_path.exists():
+            raise BukeKmHidError("未找到 HID 输入组件，请确认程序目录完整")
+
+        try:
+            self._dll = ctypes.windll.LoadLibrary(str(dll_path))
+        except Exception as exc:
+            raise BukeKmHidError(f"加载 HID 输入组件失败: {exc}") from exc
+
+        self._dll.DD_btn.argtypes = [ctypes.c_int]
+        self._dll.DD_btn.restype = ctypes.c_int
+        self._dll.DD_key.argtypes = [ctypes.c_int, ctypes.c_int]
+        self._dll.DD_key.restype = ctypes.c_int
+        self._dll.DD_mov.argtypes = [ctypes.c_int, ctypes.c_int]
+        self._dll.DD_mov.restype = ctypes.c_int
+        self._dll.DD_movR.argtypes = [ctypes.c_int, ctypes.c_int]
+        self._dll.DD_movR.restype = ctypes.c_int
+        self._dll.DD_todc.argtypes = [ctypes.c_int]
+        self._dll.DD_todc.restype = ctypes.c_int
+
+        if self._dll.DD_btn(0) != 1:
+            raise BukeKmHidError("HID 输入组件初始化失败，请检查驱动、网络、权限和组件位数")
+
+    def _dd_code(self, vk_code: int) -> int:
+        dd_code = int(self._dll.DD_todc(int(vk_code)))
+        if dd_code <= 0:
+            raise BukeKmHidError(f"DD 键码转换失败: VK={vk_code}")
+        return dd_code
+
+    def key_down(self, vk_code: int) -> None:
+        self._dll.DD_key(self._dd_code(vk_code), 1)
+
+    def key_up(self, vk_code: int) -> None:
+        self._dll.DD_key(self._dd_code(vk_code), 2)
+
+    def mouse_move(self, x: int, y: int) -> None:
+        self._dll.DD_mov(int(x), int(y))
+
+    def mouse_move_relative(self, dx: int, dy: int) -> None:
+        self._dll.DD_movR(int(dx), int(dy))
+
+    def mouse_down(self, button: str) -> None:
+        {
+            "left": lambda: self._dll.DD_btn(1),
+            "right": lambda: self._dll.DD_btn(4),
+            "middle": lambda: self._dll.DD_btn(16),
+        }[button]()
+
+    def mouse_up(self, button: str) -> None:
+        {
+            "left": lambda: self._dll.DD_btn(2),
+            "right": lambda: self._dll.DD_btn(8),
+            "middle": lambda: self._dll.DD_btn(32),
+        }[button]()
+
+
+class HidForegroundScheduler:
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._window_order: list[int] = []
+        self._current_index = 0
+        self._check_mode = HID_SWITCH_CHECK_NONE
+
+    def configure(self, window_order: list[int], check_mode: str = HID_SWITCH_CHECK_NONE) -> None:
+        with self._lock:
+            self._window_order = [int(hwnd) for hwnd in window_order]
+            if self._current_index >= len(self._window_order):
+                self._current_index = 0
+            self._check_mode = check_mode if check_mode == HID_SWITCH_CHECK_FOREGROUND else HID_SWITCH_CHECK_NONE
+
+    def run_for_window(
+        self,
+        hwnd: int,
+        controller: "BukeHidInputController",
+        action: Callable[[], bool],
+        stop_event: Optional[threading.Event] = None,
+        log: Optional[Callable[[str, Optional[str]], None]] = None,
+    ) -> bool:
+        with self._lock:
+            if stop_event and stop_event.is_set():
+                return False
+            if not self._switch_to_window(hwnd, controller, stop_event, log):
+                return False
+            return action()
+
+    def _switch_to_window(
+        self,
+        hwnd: int,
+        controller: "BukeHidInputController",
+        stop_event: Optional[threading.Event],
+        log: Optional[Callable[[str, Optional[str]], None]],
+    ) -> bool:
+        if not self._window_order:
+            self._window_order = [int(hwnd)]
+
+        try:
+            target_index = self._window_order.index(int(hwnd))
+        except ValueError:
+            self._window_order.append(int(hwnd))
+            target_index = len(self._window_order) - 1
+
+        steps = (target_index - self._current_index) % len(self._window_order)
+        if steps:
+            if log:
+                log(f"HID 前台切换：Alt+Tab {steps} 次")
+            controller.key_down("alt")
+            if _interruptible_wait(0.08, stop_event):
+                controller.key_up("alt")
+                return False
+            for _ in range(steps):
+                controller.key_press("tab", base_delay=0.05, enable_hesitation=False, enable_rhythm=False, stop_event=stop_event)
+                if _interruptible_wait(0.12, stop_event):
+                    controller.key_up("alt")
+                    return False
+            controller.key_up("alt")
+            self._current_index = target_index
+            if _interruptible_wait(0.3, stop_event):
+                return False
+
+        if self._check_mode == HID_SWITCH_CHECK_FOREGROUND:
+            for _ in range(max(1, len(self._window_order))):
+                try:
+                    if win32gui.GetForegroundWindow() == int(hwnd):
+                        return True
+                except Exception:
+                    break
+                controller.key_down("alt")
+                if _interruptible_wait(0.05, stop_event):
+                    controller.key_up("alt")
+                    return False
+                controller.key_press("tab", base_delay=0.05, enable_hesitation=False, enable_rhythm=False, stop_event=stop_event)
+                controller.key_up("alt")
+                self._current_index = (self._current_index + 1) % len(self._window_order)
+                if _interruptible_wait(0.2, stop_event):
+                    return False
+            if log:
+                log("HID 前台切换校验失败，请确认窗口顺序未被手动改变", "red")
+            return False
+
+        return True
+
+
+_hid_foreground_scheduler = HidForegroundScheduler()
+
+
+def configure_hid_foreground_scheduler(window_order: list[int], check_mode: str = HID_SWITCH_CHECK_NONE) -> None:
+    _hid_foreground_scheduler.configure(window_order, check_mode)
+
+
+def check_buke_hid_initialization() -> Tuple[bool, bool, str]:
+    driver_installed = is_buke_hid_driver_installed()
+    BukeKmHidDevice.reset()
+    try:
+        BukeKmHidDevice.get()
+        if driver_installed:
+            return True, True, "HID 驱动已安装，初始化成功"
+        return (
+            False,
+            False,
+            "未检测到 HID 驱动服务，但 HID 仍能初始化。"
+            "这通常表示驱动刚卸载但仍在当前系统会话中残留，请重启电脑后再检测。",
+        )
+    except BukeKmHidError as exc:
+        if driver_installed:
+            return False, True, f"驱动已安装，但 HID 初始化失败：{exc}。建议重启电脑，或检查杀毒软件/安全软件拦截。"
+        return False, False, f"未检测到 HID 驱动，请点击安装驱动后重启或重新检测。详细信息：{exc}"
+
+
+class PyWin32InputController:
+    mode = INPUT_BACKEND_PYWIN32
+    is_hid = False
+
+    def run_for_window(self, hwnd: int, action: Callable[[], bool], stop_event=None, log=None) -> bool:
+        return action()
+
+    def key_press(self, hwnd: int, key: str, **kwargs) -> bool:
+        return humanized_key_press(hwnd, key, **kwargs)
+
+    def long_press(self, hwnd: int, key: str, duration: float, **kwargs) -> bool:
+        return long_press_key(hwnd, key, duration, **kwargs)
+
+    def hold_down(self, hwnd: int, key: str) -> bool:
+        return background_key_down(hwnd, key)
+
+    def hold_up(self, hwnd: int, key: str) -> bool:
+        return background_key_up(hwnd, key)
+
+    def click(self, hwnd: int, x: int, y: int, button: str = "left", **kwargs) -> bool:
+        return click_mouse(hwnd, x, y, button, **kwargs)
+
+
+class BukeHidInputController:
+    mode = INPUT_BACKEND_BUKE_HID
+    is_hid = True
+
+    def __init__(self, scheduler: HidForegroundScheduler = None):
+        self.device = BukeKmHidDevice.get()
+        self.scheduler = scheduler or _hid_foreground_scheduler
+
+    def run_for_window(self, hwnd: int, action: Callable[[], bool], stop_event=None, log=None) -> bool:
+        return self.scheduler.run_for_window(hwnd, self, action, stop_event=stop_event, log=log)
+
+    def _vk(self, key: str) -> Optional[int]:
+        vk_code = get_vk_code(key)
+        if vk_code is None:
+            print(f"未知的按键: {key}")
+        return vk_code
+
+    def key_down(self, key: str) -> bool:
+        vk_code = self._vk(key)
+        if vk_code is None:
+            return False
+        self.device.key_down(vk_code)
+        return True
+
+    def key_up(self, key: str) -> bool:
+        vk_code = self._vk(key)
+        if vk_code is None:
+            return False
+        self.device.key_up(vk_code)
+        return True
+
+    def key_press(
+        self,
+        key: str,
+        base_delay: float = 0.05,
+        enable_hesitation: bool = True,
+        enable_rhythm: bool = True,
+        stop_event: Optional[threading.Event] = None,
+    ) -> bool:
+        if stop_event and stop_event.is_set():
+            return False
+        if enable_hesitation and not HumanizedInput._maybe_add_hesitation(stop_event):
+            return False
+        if not HumanizedInput._simulate_micro_movement(stop_event):
+            return False
+        if not self.key_down(key):
+            return False
+        key_duration = max(base_delay, HumanizedInput._get_key_duration())
+        interrupted = _interruptible_wait(key_duration, stop_event)
+        self.key_up(key)
+        if interrupted:
+            return False
+        if enable_rhythm and _interruptible_wait(HumanizedInput._get_inter_key_delay(), stop_event):
+            return False
+        return True
+
+    def long_press(
+        self,
+        key: str,
+        duration: float,
+        enable_hesitation: bool = True,
+        stop_event: Optional[threading.Event] = None,
+    ) -> bool:
+        if stop_event and stop_event.is_set():
+            return False
+        if enable_hesitation and not HumanizedInput._maybe_add_hesitation(stop_event):
+            return False
+        if not self.key_down(key):
+            return False
+        interrupted = _interruptible_wait(duration * random.uniform(0.95, 1.05), stop_event)
+        self.key_up(key)
+        return not interrupted
+
+    def click(self, hwnd: int, x: int, y: int, button: str = "left", hold_time: float = 0.05, stop_event=None) -> bool:
+        if button not in {"left", "right", "middle"}:
+            raise ValueError(f"不支持的鼠标按钮：{button}")
+        if not win32gui.IsWindow(hwnd):
+            raise ValueError(f"无效的窗口句柄：{hwnd}")
+        if stop_event and stop_event.is_set():
+            return False
+        self.device.mouse_down(button)
+        interrupted = _interruptible_wait(hold_time, stop_event)
+        self.device.mouse_up(button)
+        return not interrupted
+
+
+def create_input_controller(mode: str = INPUT_BACKEND_BUKE_HID):
+    if mode == INPUT_BACKEND_PYWIN32:
+        return PyWin32InputController()
+    return BukeHidInputController()
 
 
 def activate_window(hwnd: int, force: bool = True) -> bool:
